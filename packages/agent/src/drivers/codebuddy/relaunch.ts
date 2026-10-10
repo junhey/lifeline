@@ -10,6 +10,7 @@ import {
   defaultQueryRegistry,
   defaultQueryUninstallRegistry,
 
+  isIdeUpdaterRunningDarwin,
   isProcessRunningWin,
   memoizeExeWithTtl,
 
@@ -40,6 +41,8 @@ export interface CodeBuddyCdpRelaunchDeps {
   isCodeBuddyRunning: () => boolean;
   /** See `IdeCdpRelaunchDeps.canRelaunch`: ask **before** quitting; if we cannot relaunch, do not quit. */
   canRelaunch?: () => boolean;
+  /** macOS only: ShipIt resident with a staged update → the relauncher must stand down (see `relaunch-engine.ts`). */
+  isCodeBuddyUpdaterRunning?: () => boolean;
   quitCodeBuddy: () => Promise<boolean>;
   openCodeBuddyWithCdp: (port: number) => Promise<void>;
   log: (msg: string) => void;
@@ -66,6 +69,7 @@ export function createCodeBuddyCdpRelauncher(opts: {
     now: opts.deps.now,
     isRunning: opts.deps.isCodeBuddyRunning,
     canRelaunch: opts.deps.canRelaunch,
+    isUpdaterRunning: opts.deps.isCodeBuddyUpdaterRunning,
     quit: opts.deps.quitCodeBuddy,
     openWithCdp: opts.deps.openCodeBuddyWithCdp,
     log: opts.deps.log,
@@ -178,6 +182,10 @@ export function defaultCodeBuddyCdpRelaunchDeps(opts: { exeTtlMs?: number } = {}
     platform: process.platform,
     now: () => Date.now(),
     isCodeBuddyRunning: win ? isCodeBuddyRunningWin : isCodeBuddyRunningDarwin,
+    // macOS only (same rationale as Cursor): ShipIt resident = staged update waiting.
+    isCodeBuddyUpdaterRunning: win
+      ? undefined
+      : () => CODEBUDDY_APP_CANDIDATES.some(name => isIdeUpdaterRunningDarwin(name)),
     canRelaunch: win ? () => resolveExe() !== undefined : undefined,
     quitCodeBuddy: win ? quitCodeBuddyWin : quitCodeBuddyDarwin,
     openCodeBuddyWithCdp: win ? p => openCodeBuddyWithCdpWin(p, { findExe: resolveExe }) : openCodeBuddyWithCdpDarwin,

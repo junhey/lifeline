@@ -519,7 +519,7 @@ export class CDPBridge extends EventEmitter {
           // "started but never self-heals" (review must-fix 1).
           // Also covers the other end: when a machine has only one IDE, the
           // other slot's process is not running → do not keep reporting a fake fault.
-          if (result === 'skipped-not-running') {
+          if (result === 'skipped-not-running' || result === 'skipped-update-in-progress') {
             this.setIssue(null);
             this.scheduleReconnect('no-listener', { quiet: true });
             return;

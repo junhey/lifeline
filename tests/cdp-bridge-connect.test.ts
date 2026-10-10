@@ -189,6 +189,31 @@ describe('CDPBridge.connect', () => {
     assert.equal(issues.length, 0);
   });
 
+  it('stays quiet while an IDE update is in progress (ShipIt swapping the .app)', async () => {
+    let relaunch = 0;
+    const issues: Array<CdpIssue | null> = [];
+    const bridge = new CDPBridge(dummyConfig(), {
+      relauncher: {
+        // IDE process still visible (quitting) + updater running → stand down
+        maybeRelaunch: async () => {
+          relaunch += 1;
+          return 'skipped-update-in-progress';
+        },
+      },
+      probe: async () => probeFail('no-listener', { detail: 'ECONNREFUSED' }),
+      createClient: () => new FakeCdpClient() as unknown as CdpClient,
+    });
+    bridge.on('issue', (issue: CdpIssue | null) => issues.push(issue));
+    bridge.on('error', () => {});
+
+    await bridge.connect();
+    await bridge.disconnect();
+
+    assert.equal(relaunch, 1);
+    // Update in progress = "waiting for the installer", not a fault: quiet, no issue.
+    assert.equal(issues.length, 0);
+  });
+
   it('keeps using port 0 while the port file keeps moving after each relaunch', async () => {
     let mtime = 100;
     const ports: number[] = [];

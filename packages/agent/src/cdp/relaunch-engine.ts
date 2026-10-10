@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 export type RelaunchResult
   = | 'relaunched'
     | 'skipped-not-running'
+    | 'skipped-update-in-progress'
     | 'skipped-cooldown'
     | 'skipped-platform'
     | 'skipped-quit-pending'
@@ -38,6 +39,15 @@ export interface IdeCdpRelaunchDeps {
    * `undefined` = do not check. **Ask before quitting**: if we cannot launch, we must not quit.
    */
   canRelaunch?: () => boolean;
+  /**
+   * Whether the IDE's updater (Squirrel/ShipIt, ToDesktop flavor) is currently
+   * running with a staged update. **Measured**: after the user clicks
+   * "restart and update", ShipIt stays resident waiting for the app to quit,
+   * then needs 8–15s to swap the whole `.app`. If we self-heal (`open -a`) in
+   * that window we relaunch the **old** bundle mid-replace → ShipIt aborts with
+   * "App Still Running" and the update never lands. See `skipped-update-in-progress`.
+   */
+  isUpdaterRunning?: () => boolean;
   quit: () => Promise<boolean>;
   openWithCdp: (port: number) => Promise<void>;
   log: (msg: string) => void;
@@ -134,6 +144,8 @@ export function createIdeCdpRelauncher(opts: {
    * report once more.
    */
   let noExeLogged = false;
+  /** Same de-dupe rationale as `noExeLogged`: hit once per 30s reconnect, so log once per episode. */
+  let updaterLogged = false;
 
   return {
     async maybeRelaunch(port: number): Promise<RelaunchResult> {
@@ -142,6 +154,23 @@ export function createIdeCdpRelauncher(opts: {
       if (!deps.isRunning()) {
         seenRunningAt = 0;
         return 'skipped-not-running';
+      }
+      // **Update in flight**: the IDE is running (or just quit itself) and its
+      // updater is about to swap the `.app`. Do NOT quit+reopen here —
+      // `open -a` would resurrect the old bundle mid-install and abort the
+      // update ("App Still Running"). ShipIt relaunches the new version
+      // itself; we reconnect to it on the next quiet poll.
+      // Like `skipped-no-exe`: must sit **before** `lastAttempt = now` so it
+      // consumes neither cooldown nor burst attempts.
+      if (deps.isUpdaterRunning?.()) {
+        if (!updaterLogged) {
+          updaterLogged = true;
+          deps.log(
+            `${productName} update is in progress (its updater is running); NOT relaunching it — `
+            + 'waiting for the installer to finish and start the new version',
+          );
+        }
+        return 'skipped-update-in-progress';
       }
       const now = deps.now();
       if (seenRunningAt === 0)
@@ -211,8 +240,41 @@ export function createIdeCdpRelauncher(opts: {
       lastAttempt = 0;
       attempts = [];
       noExeLogged = false;
+      updaterLogged = false;
     },
   };
+}
+
+/**
+ * macOS: is this IDE's updater (Squirrel/ShipIt — Cursor & CodeBuddy both use
+ * the ToDesktop flavor) running? Measured after "restart and update":
+ * `…/<App>.app/Contents/Frameworks/Squirrel.framework/Resources/ShipIt` stays
+ * resident while a staged update waits for the app to quit, and exits once the
+ * install finishes. Path suffix match (no `/Applications/` prefix) so custom
+ * install dirs still hit.
+ *
+ * **Anchored + escaped** (`(^|/)Cursor\.app/…`): an unanchored substring would
+ * also match some other app whose bundle name merely **ends** with ours
+ * (`NotCursor.app/…` contains `Cursor.app/…`), silently suppressing this IDE's
+ * self-heal for as long as that unrelated update runs.
+ */
+export function ideUpdaterPgrepPattern(appName: string): string {
+  const escaped = appName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return `(^|/)${escaped}\\.app/Contents/Frameworks/Squirrel\\.framework/Resources/ShipIt`;
+}
+
+export function isIdeUpdaterRunningDarwin(appName: string, deps: WinProcDeps = {}): boolean {
+  const run = deps.run ?? spawnSync;
+  try {
+    const r = run('pgrep', ['-f', ideUpdaterPgrepPattern(appName)], {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    return r.status === 0 && Boolean(r.stdout?.trim());
+  }
+  catch {
+    return false;
+  }
 }
 
 /** First field of each `tasklist /NH /FO CSV` row (image name). On no match there is only an `INFO:` line → `[]`. */

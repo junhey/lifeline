@@ -298,6 +298,7 @@ export type NotCdpCause = 'http' | 'foreign';
 export type CdpRelaunchHint
   = | 'relaunched'
     | 'skipped-not-running'
+    | 'skipped-update-in-progress'
     | 'skipped-cooldown'
     | 'skipped-quit-pending'
     | 'skipped-warming-up'

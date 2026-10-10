@@ -5,7 +5,9 @@ import { describe, it } from 'node:test';
 import {
   cdpPortFromUrl,
   createIdeCdpRelauncher,
+  ideUpdaterPgrepPattern,
   isCdpUnreachable,
+  isIdeUpdaterRunningDarwin,
   isProcessRunningWin,
   memoizeExeWithTtl,
   nextReconnectDelay,
@@ -132,6 +134,82 @@ describe('createCursorCdpRelauncher', () => {
     const relauncher = createCursorCdpRelauncher({ graceMs: 0, deps: ctx.deps });
     assert.equal(await relauncher.maybeRelaunch(0), 'relaunched');
     assert.deepEqual(ctx.open, ['0']);
+  });
+
+  // Regression (measured on a real machine): "restart and update" quits Cursor, ShipIt starts
+  // swapping the .app, and our self-heal `open -a Cursor` resurrects the old bundle mid-replace →
+  // ShipIt aborts ("App Still Running") and the update never lands.
+  it('does not quit or relaunch while the updater (ShipIt) is running with a staged update', async () => {
+    const logs: string[] = [];
+    let updaterRunning = true;
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      isCursorUpdaterRunning: () => updaterRunning,
+      log: m => logs.push(m),
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, cooldownMs: 60_000, deps: ctx.deps });
+    assert.equal(await relauncher.maybeRelaunch(0), 'skipped-update-in-progress');
+    assert.equal(ctx.quit, 0, '绝不能退一个正在被替换的应用');
+    assert.deepEqual(ctx.open, [], '绝不能用 open -a 把旧版本拉回来');
+    assert.equal(logs.length, 1);
+
+    // Update done (ShipIt exited): the next attempt must NOT slip into the cooldown branch —
+    // skipping never consumed cooldown (same invariant as skipped-no-exe).
+    updaterRunning = false;
+    assert.equal(await relauncher.maybeRelaunch(0), 'relaunched');
+    assert.equal(ctx.quit, 1);
+  });
+
+  it('logs the update-in-progress reason only once per episode', async () => {
+    const logs: string[] = [];
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      isCursorUpdaterRunning: () => true,
+      log: m => logs.push(m),
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, deps: ctx.deps });
+    await relauncher.maybeRelaunch(0);
+    await relauncher.maybeRelaunch(0);
+    assert.equal(logs.length, 1, '每 30s 的安静重连不该重复刷同一行');
+  });
+
+  it('relaunches normally when the updater is not running', async () => {
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      isCursorUpdaterRunning: () => false,
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, deps: ctx.deps });
+    assert.equal(await relauncher.maybeRelaunch(0), 'relaunched');
+    assert.equal(ctx.quit, 1);
+  });
+
+  // Order lock: the updater check must sit BEFORE the grace branch. If someone moves it after,
+  // this returns 'skipped-warming-up' → bridge's setIssue(issue) reports a fault instead of staying quiet.
+  it('skips for the updater even inside the warm-up grace window', async () => {
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      isCursorUpdaterRunning: () => true,
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 1500, deps: ctx.deps });
+    assert.equal(await relauncher.maybeRelaunch(0), 'skipped-update-in-progress');
+    assert.equal(ctx.quit, 0);
+    assert.deepEqual(ctx.open, []);
+  });
+
+  it('clears the updater log dedupe after a successful connect', async () => {
+    const logs: string[] = [];
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      isCursorUpdaterRunning: () => true,
+      log: m => logs.push(m),
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, deps: ctx.deps });
+    await relauncher.maybeRelaunch(0);
+    await relauncher.maybeRelaunch(0);
+    assert.equal(logs.length, 1, '每 30s 的安静重连不该重复刷同一行');
+    relauncher.noteConnected();
+    await relauncher.maybeRelaunch(0);
+    assert.equal(logs.length, 2, '连上过之后重置，问题还在就能再报一次');
   });
 
   it('does not open a second instance if quit did not finish', async () => {
@@ -330,6 +408,31 @@ describe('RELAUNCH_PLATFORMS', () => {
     for (const p of ['darwin', 'win32', 'linux', 'freebsd'] as const) {
       assert.equal(RELAUNCH_PLATFORMS.includes(p), canControlIde(p), `platform ${p}`);
     }
+  });
+});
+
+describe('isIdeUpdaterRunningDarwin', () => {
+  it('pgreps for the ShipIt binary inside the app bundle', () => {
+    const seen: string[][] = [];
+    isIdeUpdaterRunningDarwin('Cursor', { run: fakeRun('79766\n', seen) });
+    assert.deepEqual(seen[0], [
+      'pgrep',
+      '-f',
+      '(^|/)Cursor\\.app/Contents/Frameworks/Squirrel\\.framework/Resources/ShipIt',
+    ]);
+  });
+
+  // An unanchored substring would also match some other app whose bundle name ends with ours
+  // (`NotCursor.app/…` contains `Cursor.app/…`) → this IDE's self-heal silently suppressed.
+  it('anchors the app name so NotCursor.app does not match Cursor', () => {
+    assert.doesNotMatch('/Applications/NotCursor.app/Contents/Frameworks/Squirrel.framework/Resources/ShipIt', new RegExp(ideUpdaterPgrepPattern('Cursor')));
+    assert.match('/Applications/Cursor.app/Contents/Frameworks/Squirrel.framework/Resources/ShipIt', new RegExp(ideUpdaterPgrepPattern('Cursor')));
+    assert.match('/Users/x/Apps/Cursor.app/Contents/Frameworks/Squirrel.framework/Resources/ShipIt', new RegExp(ideUpdaterPgrepPattern('Cursor')));
+  });
+
+  it('is true while ShipIt is resident, false once it exits', () => {
+    assert.equal(isIdeUpdaterRunningDarwin('Cursor', { run: fakeRun('79766\n') }), true);
+    assert.equal(isIdeUpdaterRunningDarwin('Cursor', { run: fakeRun('') }), false);
   });
 });
 

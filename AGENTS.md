@@ -64,5 +64,6 @@ Read the matching code and topic doc before touching these. Criteria only:
 - Linux is a **content source only** (`canControlIde()` allows `darwin | win32`). Do not probe `DISPLAY` / `WAYLAND_DISPLAY`. Escape hatch is `LIFELINE_LINUX_CDP=1`, not a code change.
 - SIGTERM (container stop / restart) must have a hard timeout (`Relay.stop` closes `engine` first). Do not re-virtualize the timeline (window indices are segments; see `packages/web/src/lib/timeline-window.ts`). `session-index-reporter` must not fall back to `listSessions()` (heads / `indexSignal` only).
 - Windows: approval-shortcut character classes must include `^` (Ctrl glyph). `daemon install` restarts an IDE that has no debug port — during development, do not install the daemon on CodeBuddy without one.
+- CDP self-heal must stand down while the IDE updater (ShipIt) is resident, or it resurrects the old `.app` mid-swap and aborts every update (see `docs/ide-drivers.md`).
 
 Probes live in `scripts/probes/` (some burn model quota). `temp/` is throwaway.
