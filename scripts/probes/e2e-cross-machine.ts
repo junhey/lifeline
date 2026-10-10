@@ -12,8 +12,8 @@ import { mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { io } from 'socket.io-client';
+import { emptyCursorState } from '../../packages/server/src/pages/empty-state.js';
 import { enrollAgentToken, TEST_AUTH_HEADER, TEST_OWNER, userHeaders } from '../../tests/relay-auth-helpers.js';
-import { emptyCursorState } from '../packages/server/src/pages/empty-state.js';
 
 const REPO = fileURLToPath(new URL('../..', import.meta.url));
 const PORT = 18799;

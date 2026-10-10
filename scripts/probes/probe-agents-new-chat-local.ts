@@ -14,14 +14,14 @@
  * Exit code: 0 = pass; 2 = rule broken; 1 = environment / precondition failure.
  */
 import 'dotenv/config';
-import type { SelectorConfig } from '../packages/server/src/types.js';
+import type { SelectorConfig } from '../../packages/server/src/types.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { CdpClient } from '../packages/agent/src/cdp/client.js';
-import { loadConfig } from '../packages/agent/src/config.js';
-import { agentsRunOnLocalJS, agentsSetRunOnJS, CommandExecutor } from '../packages/agent/src/drivers/cursor/executor.js';
-import { listCloudAgentNames } from '../packages/agent/src/drivers/cursor/tab-identity.js';
+import { CdpClient } from '../../packages/agent/src/cdp/client.js';
+import { loadConfig } from '../../packages/agent/src/config.js';
+import { agentsRunOnLocalJS, agentsSetRunOnJS, CommandExecutor } from '../../packages/agent/src/drivers/cursor/executor.js';
+import { listCloudAgentNames } from '../../packages/agent/src/drivers/cursor/tab-identity.js';
 
 interface CDPTarget { id: string; type: string; title: string; url: string; webSocketDebuggerUrl?: string }
 

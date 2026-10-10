@@ -4,14 +4,14 @@
  * Use:
  *   · Confirm where a session lives (same-titled sessions are distinguished by composerId)
  *   · Find "sessions waiting for confirm" — the mark is on the editor chat tab's codicon-question
- *     (the sidebar leading icon is only a spinner, so you cannot tell running vs waiting)
+ *     (the sidebar leading icon only shows a loader, so you cannot tell running vs waiting)
  *   · Confirm data-composer-id / data-resource-name exist (switching sessions and matching by id both depend on them)
  *
  * Usage: pnpm exec tsx scripts/probes/probe-tabs.ts [--window demo-repo]
  */
 import 'dotenv/config';
-import { CdpClient } from '../packages/agent/src/cdp/client.js';
-import { loadConfig } from '../packages/agent/src/config.js';
+import { CdpClient } from '../../packages/agent/src/cdp/client.js';
+import { loadConfig } from '../../packages/agent/src/config.js';
 
 interface CDPTarget {
   id: string;
@@ -48,7 +48,10 @@ async function main(): Promise<void> {
         const sidebarRows = Array.from(document.querySelectorAll('.agent-sidebar-list .agent-sidebar-cell')).map((el) => ({
           title: clean(el.querySelector('.agent-sidebar-cell-text')?.textContent),
           composerId: el.getAttribute('data-composer-id') || el.closest('[data-composer-id]')?.getAttribute('data-composer-id') || '',
-          running: !!el.querySelector('.spinning-loader') || !!el.querySelector('.cursor-icon-modifier-spin'),
+          // Running = the leading icon is a loader: Cursor 3.24.9 draws the glass dot-grid loader
+          // (.ui-dot-grid-loader); the old .spinning-loader / .cursor-icon-modifier-spin pair no
+          // longer appears in a project window (same read as extractor cellIsRunning).
+          running: !!el.querySelector('.spinning-loader') || !!el.querySelector('.ui-dot-grid-loader') || !!el.querySelector('.cursor-icon-modifier-spin'),
           question: !!el.querySelector('.codicon-question'),
           unread: !!el.querySelector('.agent-sidebar-cell-unread-indicator'),
         }));

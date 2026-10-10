@@ -18,8 +18,8 @@ import 'dotenv/config';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { CdpClient } from '../packages/agent/src/cdp/client.js';
-import { loadConfig } from '../packages/agent/src/config.js';
+import { CdpClient } from '../../packages/agent/src/cdp/client.js';
+import { loadConfig } from '../../packages/agent/src/config.js';
 
 interface CDPTarget { id: string; type: string; title: string; url: string; webSocketDebuggerUrl?: string }
 interface Project { name: string; workspaceId: string; fsPath: string }

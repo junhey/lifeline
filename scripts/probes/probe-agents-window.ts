@@ -10,15 +10,15 @@
  * Usage: pnpm exec tsx scripts/probes/probe-agents-window.ts [--verify 3] [--json]
  */
 import 'dotenv/config';
-import type { AgentsWindowDump } from '../packages/agent/src/drivers/cursor/agents-window.js';
-import { CdpClient } from '../packages/agent/src/cdp/client.js';
-import { loadConfig } from '../packages/agent/src/config.js';
+import type { AgentsWindowDump } from '../../packages/agent/src/drivers/cursor/agents-window.js';
+import { CdpClient } from '../../packages/agent/src/cdp/client.js';
+import { loadConfig } from '../../packages/agent/src/config.js';
 import {
   AGENTS_DUMP_TIMEOUT_MS,
 
   dumpAgentsWindow,
   mapAgentsWindowDump,
-} from '../packages/agent/src/drivers/cursor/agents-window.js';
+} from '../../packages/agent/src/drivers/cursor/agents-window.js';
 
 interface CDPTarget {
   id: string;

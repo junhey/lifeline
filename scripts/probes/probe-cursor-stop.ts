@@ -173,8 +173,9 @@ function fmt(v: unknown): string {
 }
 
 /**
- * Sidebar "running" rows — ground truth of running **independent of the stop key** (the spinner the IDE draws itself).
- * Project window `.agent-sidebar-cell-icon .spinning-loader` (or `cursor-icon-modifier-spin`);
+ * Sidebar "running" rows — ground truth of running **independent of the stop key** (the loader the IDE draws itself).
+ * Project window `.agent-sidebar-cell-icon .ui-dot-grid-loader` (Cursor 3.24.9; older builds
+ * `spinning-loader` / `cursor-icon-modifier-spin`);
  * Agents window `.ui-sidebar-menu-button-status-icon .ui-dot-grid-loader`.
  * Self-contained (serialized into the page to run).
  */
@@ -183,7 +184,8 @@ function runningRows() {
     '.agent-sidebar-cell, .ui-sidebar-menu-button[aria-id="glass-sidebar-agent-row"]',
   ));
   const running = rows.filter(r =>
-    r.querySelector('.agent-sidebar-cell-icon .spinning-loader')
+    r.querySelector('.agent-sidebar-cell-icon .ui-dot-grid-loader')
+    || r.querySelector('.agent-sidebar-cell-icon .spinning-loader')
     || r.querySelector('.cursor-icon-modifier-spin')
     || r.querySelector('.ui-sidebar-menu-button-status-icon .ui-dot-grid-loader'),
   );
