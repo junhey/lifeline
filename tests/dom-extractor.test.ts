@@ -495,6 +495,33 @@ describe('extractionFunction', () => {
     assert.equal(state.activeComposerId, '437b6f36-8e5c-46e2-89b9-e6a93e7a47db');
   });
 
+  it('reads the Cursor 3.24.9 dot-grid loader as the row running state', () => {
+    // Measured 2026-10-10 (Cursor 3.24.9): a running row's leading icon is the glass dot-grid
+    // loader (no .spinning-loader / .cursor-icon-modifier-spin any more); a finished row carries
+    // the status dot instead. Missing the new loader made a generating row report `active`, and
+    // the web (row status wins over the window-level live state) showed "空闲" mid-run.
+    const state = withDom(`
+      <main id="root"></main>
+      <div class="composer-bar editor" data-composer-id="c-live"></div>
+      <div class="agent-sidebar-list">
+        <div class="agent-sidebar-cell" data-selected="true" data-composer-id="c-live">
+          <div class="agent-sidebar-cell-icon"><div class="agent-sidebar-cell-icon-default"><div style="display: contents;"><span class="ui-dot-grid-loader" data-color="current" data-size="xs" data-shape="sine_3x3" data-variant="default" aria-hidden="true"></span></div></div></div>
+          <div class="agent-sidebar-cell-text">CLI command redesign review</div>
+        </div>
+        <div class="agent-sidebar-cell" data-selected="false" data-composer-id="c-done">
+          <div class="agent-sidebar-cell-icon"><div class="agent-sidebar-cell-icon-default"><div style="display: contents;"><span aria-label="Completed"><span class="ui-agent-status-dot" data-variant="done-seen"></span></span></div></div></div>
+          <div class="agent-sidebar-cell-text">WOA and Lifeline sync</div>
+        </div>
+      </div>
+    `);
+
+    const running = state.chatTabs.find(t => t.composerId === 'c-live');
+    assert.equal(running?.status, 'generating');
+    // The status dot of a finished row must not read as running
+    const done = state.chatTabs.find(t => t.composerId === 'c-done');
+    assert.equal(done?.status, 'idle');
+  });
+
   it('scopes lastAssistantText to the transcript container', () => {
     const state = withDom(`
       <main id="root">

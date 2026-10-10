@@ -818,9 +818,19 @@ export function extractionFunction(
       }
       catch { /* editor tab area unavailable → treat as none */ }
 
-      /** Row-level "running": sidebar leading icon is a spinner (.spinning-loader; cursor-icon-modifier-spin fallback) */
+      /**
+       * Row-level "running" = the sidebar leading icon is a loader.
+       *
+       * Cursor 3.24.9 (measured 2026-10-10): the running row renders the glass **dot-grid**
+       * loader (`.ui-dot-grid-loader[data-shape="sine_3x3"]`, the same component the Agents
+       * window rows use); `.spinning-loader` / `.cursor-icon-modifier-spin` no longer appear
+       * in a project window. Missing it reported a generating row as `active`, and the web
+       * (a row status wins over the window-level live state) showed "空闲" with the input
+       * unlocked while the session was generating.
+       */
       const cellIsRunning = (tab: Element): boolean =>
         tab.querySelector('.agent-sidebar-cell-icon .spinning-loader') !== null
+        || tab.querySelector('.agent-sidebar-cell-icon .ui-dot-grid-loader') !== null
         || tab.querySelector('.cursor-icon-modifier-spin') !== null;
 
       // Note: Cursor session rows also have a trailing "finished but unread"
