@@ -77,7 +77,7 @@ describe('relay HTTP auth', { concurrency: 1 }, () => {
   it('/healthz is public; /api/health and / require identity', async () => {
     const z = await fetch(`http://127.0.0.1:${port}/healthz`);
     assert.equal(z.status, 200);
-    assert.deepEqual(await z.json(), { ok: true });
+    assert.deepEqual(await z.json(), { ok: true, agents: 0 });
 
     const health = await fetch(`http://127.0.0.1:${port}/api/health`);
     assert.equal(health.status, 403);

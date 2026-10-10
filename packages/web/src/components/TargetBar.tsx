@@ -24,6 +24,9 @@ export function TargetBar() {
 
   // "Running" is the row-level spinner (including the optimistic-switch target session); live is only fallback, so a long task no longer goes dark mid-run.
   const running = isActiveSessionWorking(state, pendingHere);
+  // Multitask delegation: the session itself is done, only background sub-agents run
+  // (the session row keeps its spinner like the IDE sidebar). Distinct hint instead of "进行中".
+  const backgroundRunning = !running && !pendingHere && tab?.isActive === true && tab?.backgroundRunning === true;
   // The session being viewed finished, but the result hasn't been looked at (the dot on the IDE session tab) — the "completed" criterion.
   const unread = isTabUnread(viewedTabOf(state, pendingHere));
   const live = state?.agentActivityLive === true;
@@ -31,11 +34,13 @@ export function TargetBar() {
     ? 'bg-[var(--text-weak)]'
     : state?.agentStatus === 'error'
       ? 'bg-[var(--error)]'
-      : running
+      : running || backgroundRunning
         ? 'bg-[var(--accent)]'
         : 'bg-[var(--ok)]';
   // Copy follows the spinner (see targetBarStatusText: global idle must not cover row-level "running" and "finished unread").
-  const statusText = targetBarStatusText(state, running, unread, ideLabel);
+  const statusText = backgroundRunning
+    ? '后台任务运行中'
+    : targetBarStatusText(state, running, unread, ideLabel);
 
   return (
     <div className="flex min-h-11 items-center gap-2.5 border-b border-[var(--hairline)] bg-[var(--bg-1)] px-4 py-2.5">
@@ -68,7 +73,7 @@ export function TargetBar() {
           )
         : state && (
           <span className="inline-flex shrink-0 items-center gap-1.5 text-[length:var(--text-chrome)] text-[var(--text-secondary)]">
-            <span className={`dot ${running || live ? 'live-dot-pulse' : ''} ${statusTone}`} />
+            <span className={`dot ${running || live || backgroundRunning ? 'live-dot-pulse' : ''} ${statusTone}`} />
             {statusText}
           </span>
         )}

@@ -1,6 +1,7 @@
 import type { CSSProperties } from 'react';
 import { CaretDown, Warning, X } from '@phosphor-icons/react';
 import { useEffect, useRef, useState } from 'react';
+import { useLiveSessionKey } from '../hooks/useLiveSessionKey';
 import { useIsDesktop } from '../hooks/useMediaQuery';
 import { COLUMN_DEFAULT_WIDTH } from '../lib/column-width';
 import { machineLabel } from '../lib/machine-name';
@@ -21,6 +22,15 @@ import { SessionList } from './SessionList';
 import { SplitHandle } from './SplitHandle';
 import { TargetBar } from './TargetBar';
 import { Timeline } from './Timeline';
+
+/**
+ * Timeline slot, remounted per session: `key={liveKey}` means a session switch starts from clean component
+ * state — no leaked window/read state across sessions (the core restores the position from its snapshot).
+ */
+function TimelineSlot() {
+  const liveKey = useLiveSessionKey();
+  return <Timeline key={liveKey || 'none'} />;
+}
 
 function MobileSwitcher({ onClose }: { onClose: () => void }) {
   // Option order is "computers → sessions" (see below); default still lands on sessions — this panel is opened to switch sessions most of the time.
@@ -121,7 +131,7 @@ function DesktopShell({ paletteOpen, onClosePalette }: { paletteOpen: boolean; o
       <main className="shell-main">
         <TargetBar />
         <OfflineBanner />
-        <Timeline />
+        <TimelineSlot />
         <ActionCenter />
         <Composer />
       </main>
@@ -204,7 +214,7 @@ function MobileShell({
 
       <TargetBar />
       <OfflineBanner />
-      <Timeline />
+      <TimelineSlot />
       <ActionCenter />
       <Composer />
 

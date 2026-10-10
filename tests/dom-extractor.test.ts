@@ -769,3 +769,48 @@ describe('extractionFunction', () => {
     assert.equal(state.pendingApprovals[0].description, 'npm test');
   });
 });
+
+/*
+ * Multitask delegation (measured 2026-09-30): after the main reply hands work to
+ * background sub-agents, the sidebar row keeps its spinner while the session itself
+ * is finished — composer status is a terminal value and the send/stop control is
+ * back in send state. The row keeps `generating` (the IDE sidebar shows the same
+ * spinner) but must carry `backgroundRunning` so the web does not lock the input
+ * as "in progress" for the whole background run.
+ */
+describe('extractionFunction · multitask 后台委派', () => {
+  const backgroundDom = (composerStatus: string, stopButton: boolean): string => `
+    <main id="root">
+      <div class="composer-bar editor" data-composer-id="c-live" data-composer-status="${composerStatus}"></div>
+      ${stopButton ? '<div class="send-with-mode"><button data-stop-button="true"></button></div>' : ''}
+    </main>
+    <div class="agent-sidebar-list">
+      <div class="agent-sidebar-cell" data-composer-id="c-live" data-selected="true">
+        <div class="agent-sidebar-cell-icon"><div class="spinning-loader"></div></div>
+        <div class="agent-sidebar-cell-text">Delegated session</div>
+      </div>
+    </div>
+  `;
+
+  it('row spinner + 会话本体结束 → status generating + backgroundRunning', () => {
+    const state = withDom(backgroundDom('completed', false));
+    const active = state.chatTabs.find(t => t.isActive);
+    assert.equal(active?.status, 'generating');
+    assert.equal(active?.backgroundRunning, true);
+    assert.equal(state.activeComposerId, 'c-live');
+  });
+
+  it('stop 按钮在（会话本体在生成）→ 不打 backgroundRunning', () => {
+    const state = withDom(backgroundDom('completed', true));
+    const active = state.chatTabs.find(t => t.isActive);
+    assert.equal(active?.status, 'generating');
+    assert.equal(active?.backgroundRunning, undefined);
+  });
+
+  it('composer 状态为 generating → 不打 backgroundRunning', () => {
+    const state = withDom(backgroundDom('generating', false));
+    const active = state.chatTabs.find(t => t.isActive);
+    assert.equal(active?.status, 'generating');
+    assert.equal(active?.backgroundRunning, undefined);
+  });
+});

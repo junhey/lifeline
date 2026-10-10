@@ -137,6 +137,86 @@ export function codebuddyClickExpression(path: string): string {
 }
 
 /**
+ * Marker of a **single-question** questionnaire option row (`question-floating-module_optionItem_`), vs multi mode's `..._option_`.
+ *
+ * ⚠️ Keep this as a *duplicate* of the literal inside `dumpCodeBuddyLive`, never a dedupe:
+ * that function is serialized into the page with `fn.toString()` (see its own doc), so a reference
+ * to this const would be a page-side ReferenceError while tests (in-process) stay green.
+ */
+export const CODEBUDDY_SINGLE_OPTION_MARK = 'question-floating-module_optionItem_';
+
+/**
+ * Click one option of a **single-question** questionnaire (single mode).
+ *
+ * Measured live 2026-10-05 (CodeBuddy CN 1.106.1, probe over CDP on the coding-copilot webview):
+ * one `click()` only paints `selected_` — nothing is submitted. The IDE's own
+ * `question-floating.react` does `onOptionSelect(v); setTimeout(() => onSubmit(), 0)`, and that
+ * `onSubmit` closes over the **previous** `selectedAnswer` state: on the first click it is still
+ * empty (`if (!w) return`), so the submit is skipped; the *next* click submits `w`, i.e. the option
+ * selected by the **previous** click — click A then B and the answer on the wire is A.
+ *
+ * So a single option row needs the two clicks a human ends up doing, but packed correctly:
+ *   1. click → wait for `selected_` on that very row (React's re-render, so the IDE state now holds it);
+ *   2. click again → `onSubmit` now closes over this option and submits **it**.
+ * If the row is already `selected_` before we click, one click is enough (that click is the submit) —
+ * click twice there would only risk a double submit on a fixed IDE. The same guard runs after the
+ * second click: the questionnaire root unmounting means the answer is in, stop.
+ *
+ * Only for single mode. Multi mode's `option_` rows are toggles (`answers.includes(x) ? remove : add`)
+ * and multi-select questions would be *un*selected by a second click — never route them here.
+ *
+ * Entry when the overlay is already gone (answered by an earlier click / dismissed / collapsed — the
+ * extractor treats collapsed as "no questionnaire"): report `ok` instead of `Element not found`.
+ * The select-then-confirm round trip takes ~1s, so a user tapping a *second* option inside that window
+ * would otherwise get a scary "选项没点上" for a question that is in fact already answered (the card
+ * unmounts on the next extract). A row that is missing while the overlay is still open stays an error.
+ */
+export function codebuddySingleOptionClickExpression(path: string): string {
+  return `(async () => {
+    ${CODEBUDDY_FRAME_JS}
+    const SELECTED = 'question-floating-module_selected_';
+    const ROOT_SEL = '[class*="question-floating-module_singleQuestion_"]';
+    const FLOATING_SEL = '[class*="question-floating-module_questionFloating_"]';
+    const COLLAPSED = 'question-floating-module_collapsed_';
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const isSelected = (el) => !!el && typeof el.className === 'string' && el.className.includes(SELECTED);
+    const alive = () => !!root.querySelector(FLOATING_SEL) && !!root.querySelector(${JSON.stringify(path)});
+    const first = root.querySelector(${JSON.stringify(path)});
+    if (!first) {
+      const qRoot = root.querySelector(FLOATING_SEL);
+      if (!qRoot) return { ok: true, via: 'questionnaire-gone' };
+      if (typeof qRoot.className === 'string' && qRoot.className.includes(COLLAPSED))
+        return { ok: true, via: 'questionnaire-collapsed' };
+      return { ok: false, error: 'Element not found' };
+    }
+    if (!first.closest(ROOT_SEL)) return { ok: false, error: 'Not a single-question option' };
+    const alreadySelected = isSelected(first);
+    first.click();
+    if (alreadySelected) {
+      // The click was the submit (the IDE submits the answer already held in its state).
+      for (let i = 0; i < 24 && alive(); i++) await sleep(25);
+      return { ok: true, via: 'single-submit' };
+    }
+    // Wait for React to paint the selection — the next click must read it as the "previous" answer.
+    let landed = null;
+    for (let i = 0; i < 32; i++) {
+      landed = root.querySelector(${JSON.stringify(path)});
+      if (!landed || isSelected(landed)) break;
+      await sleep(25);
+    }
+    if (!alive()) return { ok: true, via: 'single-submitted' };
+    if (!isSelected(landed)) return { ok: true, via: 'single-select-unconfirmed' };
+    // Grace beat: a fixed IDE that submits on the first click would drop the overlay here.
+    await sleep(120);
+    const again = root.querySelector(${JSON.stringify(path)});
+    if (!again || !alive()) return { ok: true, via: 'single-submitted' };
+    again.click();
+    for (let i = 0; i < 40 && alive(); i++) await sleep(25);
+    return { ok: true, via: 'single-confirm' };
+  })()`;
+}
+
+/**
  * Click a row by value. When kind = 'tab', `value` may be a session id
  * (data-session-tab-id, **preferred, exact**) or a title (exact → prefix
  * fallback). Session switches should pass an id: the sidebar can have

@@ -5,7 +5,7 @@ import type { IdeKind } from './sources/types.js';
 import type { ChatElement, CursorState } from './types.js';
 import { hostname } from 'node:os';
 import { includeProcessEnabled, loadCliConfig } from '../../cli/src/config.js';
-import { IDE_LABELS } from '../../protocol/src/index.js';
+import { IDE_LABELS, SYNC_REASON_PATCH_GAP } from '../../protocol/src/index.js';
 import { attachIdeCommandHandlers } from './command-router.js';
 import { loadConfig, loadSelectors } from './config.js';
 import { applyContentSource, ContentLiveRuntime } from './content-runtime.js';
@@ -19,6 +19,7 @@ import {
 import { registeredDrivers } from './drivers/index.js';
 import { createIdeSlot } from './ide-slot.js';
 import { canControlIde, detectLiveIdes } from './live-ides.js';
+import { PatchSequencer } from './patch-sequencer.js';
 import { SessionIndexReporter } from './session-index-reporter.js';
 import { resolveSessionId } from './session-lookup.js';
 import { parseIde } from './types.js';
@@ -138,6 +139,8 @@ async function main(): Promise<void> {
   // reported per IDE (P4 per-ide: server writes the matching slot; packets from
   // old agents without ide fall back to cursor on the server).
   const slots: Partial<Record<IdeKind, IdeSlot>> = {};
+  // Every state:patch is numbered so the server can notice a lost one and ask for a full state.
+  const patchSeq = new PatchSequencer();
   for (const { kind, driver } of drivers) {
     slots[kind] = createIdeSlot({
       kind,
@@ -146,7 +149,7 @@ async function main(): Promise<void> {
       config,
       runtime: runtimes[kind] ?? null,
       onPatch: (patch) => {
-        uplink.send('state:patch', { ide: kind, patch });
+        uplink.send('state:patch', patchSeq.stamp(kind, patch));
       },
       onConnection: (connected: boolean) => {
         uplink.send('connection:status', { ide: kind, connected });
@@ -185,7 +188,7 @@ async function main(): Promise<void> {
     for (const { kind } of drivers) {
       ides[kind] = slots[kind]!.stateManager.getCurrentState();
     }
-    uplink.send('state:full', { ides });
+    uplink.send('state:full', { ides, patchSeq: patchSeq.baseline() });
     for (const { kind } of drivers) {
       const active = runtimes[kind]?.getActiveSession();
       if (active)
@@ -193,11 +196,14 @@ async function main(): Promise<void> {
     }
   };
   uplink.on('connected', sendFullState);
-  uplink.on('sync', () => {
+  uplink.on('sync', (payload?: { reason?: string }) => {
     // The server may have a fresh ledger (this machine just connected, or was
     // just deleted on the web): re-report the full census too, or an unchanged
     // fingerprint skips every round and the server stays empty.
-    indexReporter.reset();
+    // Exception: a patch-gap sync only says the live state drifted; the census is
+    // untouched, and re-sending hundreds of session rows for it would be waste.
+    if (payload?.reason !== SYNC_REASON_PATCH_GAP)
+      indexReporter.reset();
     sendFullState();
   });
 

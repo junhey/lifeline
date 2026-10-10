@@ -2,6 +2,7 @@ import type { Namespace, Socket, Server as SocketServer } from 'socket.io';
 import type {
   AgentPlatform,
   AgentRegisterPayload,
+  PatchSeqBaseline,
   SessionBodyPayload,
   SessionGetPayload,
   SessionMeta,
@@ -13,7 +14,7 @@ import type { AgentIdesState, IdeKind } from './ide.js';
 import type { ChatElement, ChatTab, CommandPayload, CommandResult, CursorState } from './types.js';
 import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
-import { isIdeKind, MACHINE_NAME_MAX_LENGTH, toAgentPlatform } from '../../protocol/src/index.js';
+import { isIdeKind, MACHINE_NAME_MAX_LENGTH, SYNC_REASON_PATCH_GAP, toAgentPlatform } from '../../protocol/src/index.js';
 import {
 
   applyIdePatch,
@@ -113,7 +114,27 @@ interface AgentConn {
    * as the criterion (review R1).
    */
   contentSource?: boolean;
+  /**
+   * `state:patch` sequence tracking (in-memory only). Seeded by the baseline on `state:full`; `undefined`
+   * = no baseline yet (old agent, or no full since this socket registered).
+   */
+  patchTrack?: PatchTrack;
+  /** Last time this server asked the agent to re-sync because of a patch gap (cooldown anchor). */
+  lastGapSyncAt?: number;
 }
+
+interface PatchTrack {
+  epoch: string;
+  last: Partial<Record<IdeKind, number>>;
+  /** A gap was seen and no full state has arrived since — keep asking (rate-limited) on later patches. */
+  desynced: boolean;
+}
+
+/**
+ * Minimum spacing between gap-triggered `agent:sync` requests per machine. A full state answers within
+ * milliseconds; this only stops a misbehaving agent from making the server ask on every ~1Hz patch.
+ */
+const PATCH_GAP_SYNC_COOLDOWN_MS = 10 * 1000;
 
 /** Requester-registration TTL; once it expires without another look, content is no longer forwarded. */
 const SESSION_WATCH_TTL_MS = 30 * 60 * 1000;
@@ -241,6 +262,19 @@ export class AgentDirectory extends EventEmitter {
   }
 
   /**
+   * Connected agent sockets across all owners. Deploy health check only — a
+   * bare count, no ids/owners, deliberately safe for the public /healthz.
+   */
+  connectedAgentCount(): number {
+    let n = 0;
+    for (const conn of this.agents.values()) {
+      if (conn.socket?.connected)
+        n += 1;
+    }
+    return n;
+  }
+
+  /**
    * Broadcast the list only when a per-IDE summary changed. state:patch is ~1Hz; we cannot refresh
    * machines:list on every one. But rail IDE child-rows are fully expanded by default, so their
    * dots/badges must keep up (IDE on/off, approvals coming and going).
@@ -354,6 +388,8 @@ export class AgentDirectory extends EventEmitter {
     conn.hostname = hostname;
     conn.socket = socket;
     conn.lastSeenAt = this.now();
+    // A new socket means a new agent process or connection: the old seq line means nothing; the next full re-seeds it.
+    conn.patchTrack = undefined;
     // Old agent omits version: write "unknown" rather than keeping the previous value — on a downgrade
     // back to an old CLI the stale version number would become a false signal (the page would think it is running the new one).
     conn.cliVersion = typeof info.version === 'string' && info.version ? info.version : undefined;
@@ -451,6 +487,7 @@ export class AgentDirectory extends EventEmitter {
     const idesBefore = ideStatusSignature(conn.latestState);
     const next = stripIdesState(wrapIncomingFull(payload));
     conn.latestState = next;
+    conn.patchTrack = readPatchBaseline(payload);
     conn.lastSeenAt = this.now();
     this.persistNow(conn);
     this.emit('state:full', conn.agentId, this.outwardState(conn));
@@ -463,12 +500,56 @@ export class AgentDirectory extends EventEmitter {
     const conn = this.agents.get(this.socketToAgent.get(socket.id)!)!;
     const { ide, patch } = readIdePatch(payload);
     const { messages: _drop, ...rest } = patch;
+    this.trackPatchSeq(conn, ide, payload);
     const idesBefore = ideStatusSignature(conn.latestState);
     conn.latestState = stripIdesState(applyIdePatch(conn.latestState, ide, rest));
     conn.lastSeenAt = this.now();
     this.schedulePersist(conn);
     this.emit('state:patch', conn.agentId, { ide, patch: rest } satisfies StatePatchPayload);
     this.emitIfIdeStatusChanged(conn, idesBefore);
+  }
+
+  /**
+   * Gap detector for `state:patch` (2026-09-30). A patch is a diff, so a lost one leaves its field wrong
+   * until the next reconnect; the per-IDE `seq` lets us see the hole and pull a full state to overwrite it.
+   * The (possibly out-of-line) patch itself is still applied by the caller — it is harmless, and the full
+   * state we ask for replaces everything anyway. Payloads without `seq` (old agents) are not checked.
+   */
+  private trackPatchSeq(conn: AgentConn, ide: IdeKind, payload: unknown): void {
+    const rec = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
+    const seq = readSeq(rec.seq);
+    const epoch = typeof rec.epoch === 'string' ? rec.epoch : undefined;
+    if (seq === undefined || epoch === undefined)
+      return;
+
+    let track = conn.patchTrack;
+    const last = track && track.epoch === epoch ? track.last[ide] : undefined;
+    if (track && last !== undefined && seq === last + 1) {
+      track.last[ide] = seq;
+    }
+    else {
+      const reason = !track
+        ? 'no baseline'
+        : track.epoch !== epoch
+          ? 'agent epoch changed'
+          : last === undefined
+            ? 'no baseline for this IDE'
+            : `expected seq ${last + 1}, got ${seq}`;
+      console.warn(`[agent-hub] ${conn.agentId}/${ide}: state:patch gap (${reason}); requesting full state`);
+      // Re-anchor on what we just saw so one hole warns once instead of on every later patch.
+      if (!track || track.epoch !== epoch)
+        track = conn.patchTrack = { epoch, last: {}, desynced: true };
+      track.last[ide] = seq;
+      track.desynced = true;
+    }
+
+    if (!track.desynced)
+      return;
+    const now = this.now();
+    if (conn.lastGapSyncAt !== undefined && now - conn.lastGapSyncAt < PATCH_GAP_SYNC_COOLDOWN_MS)
+      return; // Still desynced: a later patch retries after the cooldown, so no timer is needed.
+    conn.lastGapSyncAt = now;
+    conn.socket?.emit('agent:sync', { reason: SYNC_REASON_PATCH_GAP });
   }
 
   applySessionsIndex(socket: AgentSocket, payload: SessionsIndexPayload): void {
@@ -609,15 +690,17 @@ export class AgentDirectory extends EventEmitter {
       return;
     const ide = parseIde(payload.ide);
     const seq = readSeq(payload.seq);
+    // Forward what the mirror stored: its flatIndex may have been settled against rows already held.
+    let stored = messages;
     try {
-      this.sessionStore?.appendSession(agentId, sessionId, messages, ide, seq);
+      stored = this.sessionStore?.appendMessages(agentId, sessionId, messages, ide, seq) ?? messages;
     }
     catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[agent-hub] appendSession failed: ${message}`);
     }
-    this.emit('session:append', agentId, { sessionId, messages, ide, seq });
-    this.relayToWatchers(ide, sessionId, 'session:append', { sessionId, messages, ide, seq }, agentId);
+    this.emit('session:append', agentId, { sessionId, messages: stored, ide, seq });
+    this.relayToWatchers(ide, sessionId, 'session:append', { sessionId, messages: stored, ide, seq }, agentId);
     timingLog('hub:session-append', {
       agentId,
       ide,
@@ -649,8 +732,9 @@ export class AgentDirectory extends EventEmitter {
       this.agents.get(agentId)?.socket?.emit('session:get', { sessionId, ide });
       return;
     }
+    let stored = messages;
     try {
-      this.sessionStore?.appendSession(agentId, sessionId, messages, ide, seq);
+      stored = this.sessionStore?.appendMessages(agentId, sessionId, messages, ide, seq) ?? messages;
     }
     catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -658,7 +742,7 @@ export class AgentDirectory extends EventEmitter {
     }
     // The mirror eats the full body; the copy forwarded to watchers is tail-sliced like full — "phones never receive a full body" gets no back door.
     // patch-all (the seq-behind path) is a full projection, the easiest place to push the whole session to a phone again.
-    const page = tailPage(messages);
+    const page = tailPage(stored);
     const relayPayload = page.hasMore
       ? { sessionId, messages: page.messages, ide, seq, isPage: true, hasMore: true, nextBefore: page.nextBefore }
       : { sessionId, messages: page.messages, ide, seq };
@@ -1404,6 +1488,10 @@ export class AgentHub extends EventEmitter {
     return this.directory.hasAgent(userId);
   }
 
+  connectedAgentCount(): number {
+    return this.directory.connectedAgentCount();
+  }
+
   getState(agentId: string): AgentIdesState | null {
     return this.directory.getState(agentId);
   }
@@ -1550,6 +1638,21 @@ function readIdePatch(payload: unknown): { ide: IdeKind; patch: Partial<CursorSt
     return { ide: 'cursor', patch: rec as Partial<CursorState> };
   }
   return { ide: 'cursor', patch: {} };
+}
+
+/** Baseline shipped with `state:full` (see `PatchSeqBaseline`). Anything malformed = no baseline (old behavior). */
+function readPatchBaseline(payload: unknown): PatchTrack | undefined {
+  if (!payload || typeof payload !== 'object')
+    return undefined;
+  const raw = (payload as { patchSeq?: Partial<PatchSeqBaseline> }).patchSeq;
+  if (!raw || typeof raw.epoch !== 'string' || !raw.seqs || typeof raw.seqs !== 'object')
+    return undefined;
+  const last: PatchTrack['last'] = {};
+  for (const ide of IDE_KINDS) {
+    // An IDE the agent has not patched yet has no entry: its first patch must be seq 1, i.e. baseline 0.
+    last[ide] = readSeq(raw.seqs[ide]) ?? 0;
+  }
+  return { epoch: raw.epoch, last, desynced: false };
 }
 
 /** A seq is accepted only when it is a finite number; old agents omit it → undefined (old behavior). */

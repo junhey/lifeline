@@ -15,6 +15,13 @@ import { CONFIG_DIR } from '../../cli/src/config.js';
 
 export const WATERMARK_PATH = join(CONFIG_DIR, 'content-watermark.json');
 
+/**
+ * File format version. Bumped to 2 (2026-09-30): v1 files were written by runtimes that, after a restart, pushed
+ * deltas numbered from 0 (see `emitProjected`), leaving the server's copy of those sessions out of order. Ignoring
+ * v1 files makes every session re-send one authoritative full, which rewrites the server's copy in order.
+ */
+export const WATERMARK_VERSION = 2;
+
 /** Keep a few sessions: only current / recently viewed; more is wasted disk writes */
 export const WATERMARK_MAX_SESSIONS = 4;
 /** Max index entries per session (truncating the tail is safe: fewer ids only means requesting a few extra chunks, never a miss) */
@@ -144,7 +151,10 @@ export function mergeIde(
 
 export function loadWatermarks(path = WATERMARK_PATH): Record<string, SessionWatermark> {
   try {
-    return parseWatermark(JSON.parse(readFileSync(path, 'utf-8')));
+    const raw = JSON.parse(readFileSync(path, 'utf-8')) as { version?: unknown } | null;
+    if (raw?.version !== WATERMARK_VERSION)
+      return {};
+    return parseWatermark(raw);
   }
   catch {
     return {};
@@ -157,7 +167,7 @@ export function saveWatermarks(
 ): void {
   try {
     // Prune per ide prefix; do not globally trim the whole file to 4 entries.
-    const body = JSON.stringify({ version: 1, sessions: pruneWatermarksByIde(all) });
+    const body = JSON.stringify({ version: WATERMARK_VERSION, sessions: pruneWatermarksByIde(all) });
     mkdirSync(dirname(path), { recursive: true });
     const tmp = `${path}.tmp`;
     writeFileSync(tmp, body, 'utf-8');

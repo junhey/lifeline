@@ -214,6 +214,27 @@ export function bindSocket(): void {
 
   // IDE CDP connection state: phase 2 lands UI (P8c); here we only consume as a placeholder.
   socket.on('connection:status', () => {});
+
+  /**
+   * Switching to a cached session must reconcile once (production mobile pass, 2026-10-04):
+   * appends during a disconnect (phone lock) or while another session was viewed are NOT replayed,
+   * the reconnect verify only covers the session live at reconnect time, and a cached body makes
+   * `ensureLiveBody()` a no-op — so switching back to a session whose agent already finished kept
+   * showing the stale tail forever. Track the settled live key (`currentLiveKey` semantics — the
+   * optimistic pending target is NOT fetched here; the verify fires when the switch lands in
+   * `state:patch`); on change, verify if that session is cached. Cheap when fresh: `sinceSeq` →
+   * `session:sync` (a few bytes); only a real gap re-projects the body.
+   */
+  let lastVerifiedKey = '';
+  useIdesStore.subscribe((s) => {
+    const key = liveSessionKeyOf(s.selectedIde, s.ides[s.selectedIde]);
+    if (key === lastVerifiedKey || !key)
+      return;
+    lastVerifiedKey = key;
+    const sessions = useSessionsStore.getState();
+    if (sessions.bodies[key] && !sessions.unavailable[key])
+      ensureLiveBody({ verify: true });
+  });
 }
 
 export { sessionBodyKey };

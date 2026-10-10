@@ -7,9 +7,11 @@ import {
   CODEBUDDY_FRAME_JS,
   CODEBUDDY_MODEL_ROWS_JS,
   CODEBUDDY_MODEL_TRIGGER_SEL,
+  CODEBUDDY_SINGLE_OPTION_MARK,
   codebuddyClickByValueExpression,
   codebuddyClickExpression,
   codebuddyClickModelExpression,
+  codebuddySingleOptionClickExpression,
 } from './extractor.js';
 import {
   composerStillContains,
@@ -219,6 +221,25 @@ export class CodeBuddyExecutor {
       return { commandId, ok: false, error: 'Missing selectorPath' };
     try {
       const value = await client.evaluate(codebuddyClickExpression(path));
+      return clickResult(commandId, value);
+    }
+    catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      return { commandId, ok: false, error };
+    }
+  }
+
+  /**
+   * Single-question questionnaire option: needs select-then-confirm, not a plain click
+   * (see codebuddySingleOptionClickExpression). Multi mode's `option_` rows stay on clickPath.
+   */
+  private async clickSingleOption(commandId: string, path: string): Promise<CommandResult> {
+    const client = this.requireClient();
+    if (!('evaluate' in client)) {
+      return { commandId, ...client };
+    }
+    try {
+      const value = await client.evaluate(codebuddySingleOptionClickExpression(path));
       return clickResult(commandId, value);
     }
     catch (err) {
@@ -617,6 +638,8 @@ export class CodeBuddyExecutor {
     selectorPath: string,
     _actionLabel?: string,
   ): Promise<CommandResult> {
+    if (selectorPath.includes(CODEBUDDY_SINGLE_OPTION_MARK))
+      return this.clickSingleOption(commandId, selectorPath);
     return this.clickPath(commandId, selectorPath);
   }
 }

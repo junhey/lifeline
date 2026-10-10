@@ -7,15 +7,23 @@
 import type Database from 'better-sqlite3';
 import type { ChatElement, CodeBlockItem, ToolCallElement } from '../types.js';
 import type { ContentSource } from './content-source.js';
+import type { TurnBubble } from './cursor-transcript.js';
 import type {
   MessageHeader,
   SessionMeta,
   SessionRef,
   SourceProbe,
 } from './types.js';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { loadBetterSqlite3 } from '../load-sqlite.js';
+import { fillFromTranscript, parseTranscript, TRANSCRIPT_TAIL_TURNS } from './cursor-transcript.js';
 import { diffLines } from './diff.js';
 import { project } from './project.js';
+
+/** How long a "no transcript for this session" answer is trusted before the projects dir is scanned again. */
+const TRANSCRIPT_MISS_TTL_MS = 30_000;
 
 export interface Bubble {
   bubbleId: string;
@@ -80,9 +88,15 @@ export class CursorAdapter implements ContentSource {
   readonly rootPath: string;
   private contentCache = new Map<string, string | null>();
   private readonly includeProcess: boolean;
+  /** `~/.cursor/projects` (one `<workspace>/agent-transcripts/<id>/<id>.jsonl` per chat). Tests point it elsewhere. */
+  private readonly transcriptsRoot: string;
+  private readonly transcriptFiles = new Map<string, string>();
+  private readonly transcriptMisses = new Map<string, number>();
+  private readonly fillCache = new Map<string, { key: string; fill: Map<string, string> }>();
 
-  constructor(dbPath: string, opts?: { includeProcess?: boolean }) {
+  constructor(dbPath: string, opts?: { includeProcess?: boolean; transcriptsRoot?: string }) {
     this.includeProcess = opts?.includeProcess !== false;
+    this.transcriptsRoot = opts?.transcriptsRoot ?? join(homedir(), '.cursor', 'projects');
     this.rootPath = dbPath;
     const Database = loadBetterSqlite3();
     this.db = new Database(dbPath, { readonly: true, fileMustExist: true });
@@ -126,8 +140,22 @@ export class CursorAdapter implements ContentSource {
     return this.db.pragma('data_version', { simple: true }) as number;
   }
 
+  /**
+   * A DB write moves it, and so does a write to any transcript we have already located: the database can sit idle
+   * for an hour while Cursor keeps appending finished replies to the transcript (see cursor-transcript.ts).
+   * With no transcript known the value is exactly `data_version`.
+   */
   changeSignal(): number {
-    return this.dataVersion();
+    let stamp = 0;
+    for (const file of this.transcriptFiles.values()) {
+      try {
+        stamp += Math.floor(statSync(file).mtimeMs);
+      }
+      catch {
+        /* file gone: contributes nothing, which is itself a change */
+      }
+    }
+    return this.dataVersion() + (stamp % 1_000_000_007);
   }
 
   /** Structural fingerprint: any DB write changes it, but reading is one cheap pragma. */
@@ -301,7 +329,89 @@ export class CursorAdapter implements ContentSource {
         | undefined;
       out.set(h.messageId, row?.n ?? 0);
     }
+    // A stub's stored size never changes when its text arrives via the transcript; fold the text in so the
+    // change is seen (and the bubble is re-read) the moment the fill first appears or grows.
+    for (const [id, text] of this.transcriptFill(sessionId))
+      out.set(id, (out.get(id) ?? 0) + text.length);
     return out;
+  }
+
+  /** Path of this chat's transcript, or null. Found once by scanning the projects dir, then remembered. */
+  private transcriptFile(sessionId: string): string | null {
+    const known = this.transcriptFiles.get(sessionId);
+    if (known && existsSync(known))
+      return known;
+    this.transcriptFiles.delete(sessionId);
+    const missedAt = this.transcriptMisses.get(sessionId);
+    if (missedAt !== undefined && Date.now() - missedAt < TRANSCRIPT_MISS_TTL_MS)
+      return null;
+    try {
+      for (const project of readdirSync(this.transcriptsRoot)) {
+        const file = join(this.transcriptsRoot, project, 'agent-transcripts', sessionId, `${sessionId}.jsonl`);
+        if (existsSync(file)) {
+          this.transcriptFiles.set(sessionId, file);
+          this.transcriptMisses.delete(sessionId);
+          return file;
+        }
+      }
+    }
+    catch {
+      /* no projects dir (Linux content source, fresh machine): nothing to fill from */
+    }
+    this.transcriptMisses.set(sessionId, Date.now());
+    return null;
+  }
+
+  /**
+   * bubbleId → text for this chat's stub bubbles, taken from its transcript (see cursor-transcript.ts).
+   * Cached on (transcript mtime+size, data_version): the fill can only change when one of them does.
+   */
+  private transcriptFill(sessionId: string): Map<string, string> {
+    const empty = new Map<string, string>();
+    const file = this.transcriptFile(sessionId);
+    if (!file)
+      return empty;
+    try {
+      const st = statSync(file);
+      const key = `${st.mtimeMs}:${st.size}:${this.dataVersion()}`;
+      const cached = this.fillCache.get(sessionId);
+      if (cached?.key === key)
+        return cached.fill;
+
+      // Align against **every** header, hidden ones included: Cursor hides some human bubbles from the UI
+      // (`isRenderable: false`) but the transcript still counts their turn, so the filtered `readIndex` would
+      // never match the transcript's user-message count.
+      const index = (this.readComposer(sessionId)?.fullConversationHeadersOnly ?? []).map(e => ({
+        messageId: e.bubbleId,
+        role: e.type === 1 ? ('human' as const) : ('assistant' as const),
+        preview: e.grouping?.textPreview,
+      }));
+      const humanAt = index.flatMap((h, i) => (h.role === 'human' ? [i] : []));
+      const from = humanAt[Math.max(0, humanAt.length - TRANSCRIPT_TAIL_TURNS)] ?? 0;
+      const stmt = this.db.prepare(
+        `SELECT json_extract(value, '$.text') AS text,
+                json_extract(value, '$.thinking.text') AS thinking,
+                json_extract(value, '$.toolFormerData.name') AS tool
+         FROM cursorDiskKV WHERE key = ?`,
+      );
+      const bubbles: TurnBubble[] = index.map((h, i) => {
+        const bubble: TurnBubble = { id: h.messageId, role: h.role, preview: h.preview };
+        if (i >= from) {
+          const row = stmt.get(`bubbleId:${sessionId}:${h.messageId}`) as
+            | { text: string | null; thinking: string | null; tool: string | null }
+            | undefined;
+          if (row)
+            bubble.body = { text: row.text ?? '', thinking: row.thinking ?? '', tool: row.tool != null };
+        }
+        return bubble;
+      });
+      const fill = fillFromTranscript(bubbles, parseTranscript(readFileSync(file, 'utf-8')));
+      this.fillCache.set(sessionId, { key, fill });
+      return fill;
+    }
+    catch {
+      return empty;
+    }
   }
 
   /**
@@ -365,6 +475,12 @@ export class CursorAdapter implements ContentSource {
       sessionId,
       useIndex.map(h => h.messageId),
     );
+    const fill = this.transcriptFill(sessionId);
+    for (const b of bubbles) {
+      const text = fill.get(b.bubbleId);
+      if (text !== undefined && b.text.trim() === '')
+        b.text = text;
+    }
     const diffs = this.includeProcess ? this.readDiffs(bubbles) : new Map();
     let { messages } = project(useIndex, bubbles, diffs, {
       includeProcess: this.includeProcess,

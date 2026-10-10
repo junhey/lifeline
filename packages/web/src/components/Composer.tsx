@@ -62,6 +62,9 @@ export function Composer() {
   // Session in progress (thinking/generating/running tools): lock input so we don't send into a half-done session.
   // Same criterion as title/session-row loading (row-level spinner wins); a long task doesn't unlock mid-run.
   const working = isActiveSessionWorking(state, pendingHere);
+  // Multitask delegation: the session itself is done, only background sub-agents still
+  // run (row spinner). Input stays usable — same as the IDE composer — with a hint.
+  const backgroundRunning = !working && tab?.isActive === true && tab?.backgroundRunning === true;
   const ideConnected = state?.connected === true;
   const canSend
     = draft.trim().length > 0 && !!target && !machineOffline && !machineContentOnly && !pendingHere && !working && ideConnected;
@@ -137,20 +140,22 @@ export function Composer() {
     ? `正在切换到「${pendingHere.title || '未命名'}」…`
     : working
       ? '会话进行中…'
-      : !state
-          ? '该 IDE 无状态'
-          : cdpIssue
-            ? cdpIssueCopy(cdpIssue, ideLabel).text
-            : machineContentOnly
-              ? '内容源（只读）：这台机器不接管输入'
-              : machineOffline
-                ? '机器已离线，无法发送'
-                : isDraftTab(tab)
-                // Draft: the title is the draft text (or still New Agent); don't splice it into "send to …".
-                  ? (draftText ? '草稿里的文字已填好，可直接发送' : '新会话（草稿）—— 发第一条消息')
-                  : target
-                    ? `发给 ${tab?.title ?? target.tabTitle}`
-                    : '无可用发送目标';
+      : backgroundRunning
+        ? '后台任务运行中，可继续发送'
+        : !state
+            ? '该 IDE 无状态'
+            : cdpIssue
+              ? cdpIssueCopy(cdpIssue, ideLabel).text
+              : machineContentOnly
+                ? '内容源（只读）：这台机器不接管输入'
+                : machineOffline
+                  ? '机器已离线，无法发送'
+                  : isDraftTab(tab)
+                  // Draft: the title is the draft text (or still New Agent); don't splice it into "send to …".
+                    ? (draftText ? '草稿里的文字已填好，可直接发送' : '新会话（草稿）—— 发第一条消息')
+                    : target
+                      ? `发给 ${tab?.title ?? target.tabTitle}`
+                      : '无可用发送目标';
 
   const bannerCopy = bannerVisible && issue ? cdpIssueCopy(issue, ideLabel) : null;
   const bannerText = bannerCopy

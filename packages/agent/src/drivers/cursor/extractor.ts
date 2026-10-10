@@ -1078,6 +1078,26 @@ export function extractionFunction(
           });
         }
       }
+
+      /*
+       * Multitask delegation: the sidebar row keeps its spinner while background
+       * sub-agents run, but the session itself is finished — the composer bar is
+       * back to send state (no stop button, terminal `data-composer-status`;
+       * measured 2026-09-30: completed + row spinner for the whole background
+       * run). Mark the open session's row so the web can keep the input usable
+       * instead of locking "in progress" with nothing visible happening.
+       */
+      const activeBar = document.querySelector('div.composer-bar.editor[data-composer-id]');
+      const barStatus = (activeBar?.getAttribute('data-composer-status') || '').toLowerCase();
+      const stopBtn = document.querySelector('[class*="send-with-mode"] [data-stop-button="true"]');
+      const sessionItselfGenerating = !!stopBtn || barStatus === 'in_progress' || barStatus === 'generating';
+      if (!sessionItselfGenerating) {
+        for (const t of chatTabs) {
+          if (t.isActive && t.composerId === containerComposerId && t.status === 'generating') {
+            t.backgroundRunning = true;
+          }
+        }
+      }
     }
     catch { /* skip */ }
 

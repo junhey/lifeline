@@ -158,6 +158,15 @@ export interface ChatTab {
    * so the draft can be "sent as-is".
    */
   draftText?: string;
+  /**
+   * Multitask delegation: this row's sidebar spinner only mirrors **background sub-agents**
+   * while the session itself already finished (composer back to send state, terminal
+   * `data-composer-status`). The row keeps `status: 'generating'` (the IDE sidebar shows the
+   * same spinner), but the session is not "in progress" — the input must stay usable for the
+   * whole background run (measured 2026-09-30: delegation reply out at T, spinner cleared at
+   * T+6.5min with zero visible progress in between).
+   */
+  backgroundRunning?: boolean;
 }
 
 export type WindowKind = 'project' | 'agents';

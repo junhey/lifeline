@@ -2,7 +2,7 @@ import type { CodeBuddyLiveDump } from '../packages/agent/src/drivers/codebuddy/
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { JSDOM } from 'jsdom';
-import { dumpCodeBuddyLive } from '../packages/agent/src/drivers/codebuddy/extractor.js';
+import { codebuddySingleOptionClickExpression, dumpCodeBuddyLive } from '../packages/agent/src/drivers/codebuddy/extractor.js';
 import { mapCodeBuddyLive } from '../packages/agent/src/drivers/codebuddy/live.js';
 
 /**
@@ -154,6 +154,130 @@ describe('dumpCodeBuddyLive 的问卷抽取', () => {
     const collapsed = `<div class="question-floating-module_questionFloating_ip9de question-floating-module_collapsed_LyCcQ"></div>`;
     assert.equal(withDom(collapsed, () => dumpCodeBuddyLive())?.questionnaire, null);
     assert.equal(withDom('<div></div>', () => dumpCodeBuddyLive())?.questionnaire, null);
+  });
+});
+
+/**
+ * Single-question option click (`codebuddySingleOptionClickExpression`).
+ *
+ * The IDE's own component (measured live 2026-10-05, CodeBuddy CN 1.106.1) does
+ * `onOptionSelect(v); setTimeout(() => onSubmit(), 0)`, and that `onSubmit` closes over the
+ * **previous** `selectedAnswer`: the first click only paints `selected_`, the next click submits
+ * the option selected *before* it (click A then B → B is painted, A goes on the wire).
+ * The expression must therefore click, wait for the paint, then click the same row again.
+ */
+const SINGLE_OPTIONS = `
+<div class="question-floating-module_questionFloating_ip9de question-floating-module_singleMode_PtBEC">
+  <div class="question-floating-module_singleQuestion_tIxHk">
+    <div class="question-floating-module_optionsWrapper_wRohQ">
+      <div class="question-floating-module_optionItem_rOhKt" data-opt="A">A</div>
+      <div class="question-floating-module_optionItem_rOhKt" data-opt="B">B</div>
+      <div class="question-floating-module_customInputRow_IERoA" data-opt="Other">Other</div>
+    </div>
+  </div>
+</div>`;
+
+interface SingleWindow {
+  __answer: string | null;
+  __clicks: string[];
+  eval: (code: string) => unknown;
+}
+
+const OPTION_B_SELECTED = SINGLE_OPTIONS.replace(
+  'class="question-floating-module_optionItem_rOhKt" data-opt="B"',
+  'class="question-floating-module_optionItem_rOhKt question-floating-module_selected_TgHBt" data-opt="B"',
+);
+
+/**
+ * Replay the IDE component: a click that finds an answer already held submits **that** answer
+ * (the stale closure) and unmounts the overlay; otherwise it only paints `selected_`.
+ * `heldBefore` = the answer the IDE already had (e.g. a previous click that never submitted).
+ */
+function singleDom(html: string, heldBefore: string | null = null): SingleWindow {
+  const dom = new JSDOM(html, { runScripts: 'outside-only' });
+  const win = dom.window as unknown as SingleWindow;
+  win.eval(`
+    window.__answer = null;
+    window.__clicks = [];
+    let held = ${JSON.stringify(heldBefore)};
+    for (const el of document.querySelectorAll('[class*="question-floating-module_optionItem_"]')) {
+      el.addEventListener('click', () => {
+        window.__clicks.push(el.dataset.opt);
+        if (held !== null) {
+          window.__answer = held;                       // ← the stale-closure submit
+          const root = document.querySelector('[class*="question-floating-module_questionFloating_"]');
+          if (root) root.remove();
+        }
+        held = el.dataset.opt;
+        for (const other of document.querySelectorAll('[class*="question-floating-module_optionItem_"]'))
+          other.className = 'question-floating-module_optionItem_rOhKt';
+        el.className = 'question-floating-module_optionItem_rOhKt question-floating-module_selected_TgHBt';
+      });
+    }
+  `);
+  return win;
+}
+
+const OPTION_B_PATH = '[class*="question-floating-module_singleQuestion_"] [class*="question-floating-module_optionItem_"]:nth-of-type(2)';
+
+describe('单选问卷的选项点击（select → confirm）', () => {
+  it('一次点击＝选中并提交这个选项（不是上一次选中的那个）', async () => {
+    const win = singleDom(SINGLE_OPTIONS);
+    const result = await win.eval(codebuddySingleOptionClickExpression(OPTION_B_PATH)) as { ok?: boolean; via?: string };
+    assert.equal(result.ok, true);
+    assert.equal(result.via, 'single-confirm');
+    assert.deepEqual(Array.from(win.__clicks), ['B', 'B'], 'B 需要被点两次：第一次选中、第二次提交');
+    assert.equal(win.__answer, 'B', '提交的必须是用户点的 B');
+  });
+
+  it('选项已经是选中态时只点一次（那一下就是提交，不能重复提交）', async () => {
+    const win = singleDom(OPTION_B_SELECTED, 'B');
+    const result = await win.eval(codebuddySingleOptionClickExpression(OPTION_B_PATH)) as { ok?: boolean; via?: string };
+    assert.equal(result.ok, true);
+    assert.equal(result.via, 'single-submit');
+    assert.deepEqual(Array.from(win.__clicks), ['B'], '已选中态只允许一次点击');
+    assert.equal(win.__answer, 'B');
+  });
+
+  it('选项不存在但问卷还开着 → Element not found（真的对不上）', async () => {
+    const win = singleDom(
+      '<div class="question-floating-module_questionFloating_ip9de">'
+      + '<div class="question-floating-module_singleQuestion_tIxHk"></div></div>',
+    );
+    const result = await win.eval(codebuddySingleOptionClickExpression(
+      '[class*="question-floating-module_singleQuestion_"] [class*="question-floating-module_optionItem_"]:nth-of-type(1)',
+    )) as { ok?: boolean; error?: string; via?: string };
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'Element not found');
+  });
+
+  it('问卷已经被答掉/收起 → ok，不弹报错（点第二次的那 1s 窗口）', async () => {
+    const gone = singleDom('<div id="chat"></div>');
+    const goneRes = await gone.eval(codebuddySingleOptionClickExpression(OPTION_B_PATH)) as { ok?: boolean; via?: string };
+    assert.equal(goneRes.ok, true);
+    assert.equal(goneRes.via, 'questionnaire-gone');
+    assert.deepEqual(Array.from(gone.__clicks), []);
+
+    const collapsed = singleDom(
+      '<div class="question-floating-module_questionFloating_ip9de question-floating-module_collapsed_LyCcQ"></div>',
+    );
+    const collapsedRes = await collapsed.eval(codebuddySingleOptionClickExpression(OPTION_B_PATH)) as { ok?: boolean; via?: string };
+    assert.equal(collapsedRes.ok, true);
+    assert.equal(collapsedRes.via, 'questionnaire-collapsed');
+    assert.deepEqual(Array.from(collapsed.__clicks), []);
+  });
+
+  it('点了但界面没动：如实返回未确认，不假装成功提交', async () => {
+    const win = singleDom(SINGLE_OPTIONS);
+    // Strip the IDE behavior: clicks do nothing at all.
+    win.eval(`
+      for (const el of document.querySelectorAll('[class*="question-floating-module_optionItem_"]'))
+        el.replaceWith(el.cloneNode(true));
+    `);
+    const path = '[class*="question-floating-module_singleQuestion_"] [class*="question-floating-module_optionItem_"]:nth-of-type(1)';
+    const result = await win.eval(codebuddySingleOptionClickExpression(path)) as { ok?: boolean; via?: string };
+    assert.equal(result.ok, true);
+    assert.equal(result.via, 'single-select-unconfirmed');
   });
 });
 

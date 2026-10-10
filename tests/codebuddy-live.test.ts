@@ -444,6 +444,35 @@ describe('CodeBuddyExecutor clicks', () => {
     assert.match(codebuddyClickExpression('.x'), /querySelector/);
   });
 
+  it('single-question option → select-then-confirm; multi mode keeps the plain click', async () => {
+    const seen: string[] = [];
+    const client = {
+      isConnected: () => true,
+      evaluate: async (expression: string) => {
+        seen.push(expression);
+        return { ok: true };
+      },
+    } as unknown as CdpClient;
+    const exec = new CodeBuddyExecutor({ wait: async () => {} });
+    exec.setClient(client);
+
+    const single = '[class*="question-floating-module_singleQuestion_"] [class*="question-floating-module_optionItem_"]:nth-of-type(2)';
+    assert.equal((await exec.clickAction('c-single', single)).ok, true);
+    // Two-phase expression, not the one-shot click.
+    assert.match(seen[0], /single-confirm/);
+    assert.match(seen[0], /question-floating-module_selected_/);
+    assert.notEqual(seen[0], codebuddyClickExpression(single));
+
+    const multi = '[class*="question-floating-module_questionBlock_"]:nth-of-type(2) [class*="question-floating-module_option_"]:nth-of-type(2)';
+    assert.equal((await exec.clickAction('c-multi', multi)).ok, true);
+    // Multi mode's option rows toggle: a second click would unselect. Must stay the plain click.
+    assert.equal(seen[1], codebuddyClickExpression(multi));
+
+    const cont = '[class*="question-floating-module_continueBtn_"]';
+    assert.equal((await exec.clickAction('c-cont', cont)).ok, true);
+    assert.equal(seen[2], codebuddyClickExpression(cont));
+  });
+
   it('keeps ok:false when the click target is missing', async () => {
     const client = {
       isConnected: () => true,

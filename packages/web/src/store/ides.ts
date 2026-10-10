@@ -109,6 +109,22 @@ export function liveSessionKeyOf(
   return isSyntheticComposerId(id) ? '' : `${ide}:${id}`;
 }
 
+/**
+ * The single source of the "currently viewed session body key": the optimistic pending target first
+ * (when it carries a real composer id), otherwise the active tab. '' = no body (draft / synthetic / none).
+ * The AppShell remount key and the Timeline wrapper both derive from this — keep them identical.
+ */
+export function viewedLiveKeyOf(
+  ide: IdeKind,
+  state: CursorState | undefined,
+  pending?: PendingSwitch | null,
+): string {
+  const pendingHere = pending && pending.ide === ide ? pending : null;
+  if (pendingHere && !isSyntheticComposerId(pendingHere.composerId))
+    return `${ide}:${pendingHere.composerId}`;
+  return liveSessionKeyOf(ide, state, pendingHere);
+}
+
 /** Whether the session is in progress (thinking / generating / running a tool) — shared by the session-row loading indicator and the composer input lock. Completed (idle) does not get the flag. */
 export function isSessionWorking(state: CursorState | undefined): boolean {
   if (!state)
@@ -126,6 +142,34 @@ export function isSessionWorking(state: CursorState | undefined): boolean {
  */
 export function isTabRunning(tab: ChatTab | undefined | null): boolean {
   return tab?.status === 'generating';
+}
+
+/**
+ * Whether this row carries a row-level status of its own (the IDE sidebar's answer for **this** row).
+ *
+ * Only agents that never sent `ChatTab.status` leave it empty — for those, the window-level live state may stand
+ * in for the row. Once the row has answered, that answer wins: `agentStatus` / `agentActivityLive` are one summary
+ * for the whole window, they lag behind the sidebar, and they can sit at `generating` with no activity text at all
+ * (2026-09-30: a machine whose window status never came back to idle). Standing in for a row that already answered
+ * makes the loading ring follow whichever session is being viewed — the ring follows the selection, and the
+ * composer stays locked on a machine where nothing is running.
+ */
+export function hasRowStatus(tab: ChatTab | undefined | null): boolean {
+  return typeof tab?.status === 'string' && tab.status !== '';
+}
+
+/**
+ * Whether this row draws the "running" ring.
+ *
+ * `viewingHere` is the caller's "active row of the active window" (the same notion the row highlight uses).
+ * The window-level live state may only stand in for such a row, and only while the row has no status of its
+ * own (see `hasRowStatus`) — so an honest row keeps its ring, and a stuck window summary cannot paint one on
+ * it. The ring only means "this session is running"; it never lights up during a switch.
+ */
+export function isRowWorking(tab: ChatTab, state: CursorState, viewingHere: boolean): boolean {
+  if (isTabRunning(tab))
+    return true;
+  return viewingHere && !hasRowStatus(tab) && isSessionWorking(state);
 }
 
 /**
@@ -293,15 +337,29 @@ export function viewedWindowOf(
   return (state.windows ?? []).find(w => w.id === winId) ?? null;
 }
 
-/** Whether the session being viewed is running: row-level spinner is authoritative; the active row in this window then falls back to live state (older servers / missing row status). */
+/**
+ * Whether the session being viewed is running: the row-level spinner is authoritative; the window-level live
+ * state is only a stand-in for the active row while that row has no status of its own (`hasRowStatus`) — a row
+ * that already answered active/idle must not be re-flagged by the window summary (2026-09-30: the input stayed
+ * locked as "会话进行中…" on a machine whose window status sat at generating while nothing was running).
+ */
 export function isActiveSessionWorking(
   state: CursorState | undefined,
   pending?: PendingSwitch | null,
 ): boolean {
   const tab = viewedTabOf(state, pending);
-  if (isTabRunning(tab))
+  /*
+   * Multitask delegation: the viewed row's spinner can mirror background
+   * sub-agents while the session itself already finished (`backgroundRunning`;
+   * the IDE composer is back in send state). Not "in progress" — must not lock
+   * the input for the whole background run (measured 2026-09-30: reply out at
+   * T, spinner cleared at T+6.5min with nothing visible in between).
+   */
+  if (isTabRunning(tab) && !tab?.backgroundRunning)
     return true;
   if (!tab?.isActive || !state)
+    return false;
+  if (hasRowStatus(tab))
     return false;
   if (state.activeWindowId && tab.windowId && tab.windowId !== state.activeWindowId)
     return false;

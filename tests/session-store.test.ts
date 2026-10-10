@@ -94,6 +94,55 @@ describe('SessionStore', () => {
     assert.equal(tool.actions, undefined);
   });
 
+  describe('flatIndex collisions from the wire', () => {
+    const human = (id: string, flatIndex: number, text = id): ChatElement =>
+      ({ type: 'human', id, flatIndex, text, mentions: [] });
+    const seed = (n: number): void => {
+      store.writeSession('agent-a', 's1', Array.from({ length: n }, (_, i) => human(`old${i}`, i)), 'cursor', 0);
+    };
+    const order = (): string[] => (store.readSession('agent-a', 's1', 'cursor') ?? []).map(m => m.id);
+
+    it('an agent numbering from 0 again lands after the held rows, not in the middle (2026-09-30)', () => {
+      seed(5);
+      const stored = store.appendMessages('agent-a', 's1', [human('new0', 0), human('new1', 1)], 'cursor', 1);
+      assert.deepEqual(stored.map(m => m.flatIndex), [5, 6]);
+      assert.deepEqual(order(), ['old0', 'old1', 'old2', 'old3', 'old4', 'new0', 'new1']);
+      // The payload carries the corrected number too — that is what watchers and the page reader see.
+      assert.equal((store.readSession('agent-a', 's1', 'cursor')?.[5] as ChatElement).flatIndex, 5);
+    });
+
+    it('a streamed update re-sent with a stale number keeps the slot it was given', () => {
+      seed(3);
+      store.appendMessages('agent-a', 's1', [human('new0', 0, 'part')], 'cursor', 1);
+      store.appendMessages('agent-a', 's1', [human('new0', 0, 'part+more')], 'cursor', 2);
+      assert.deepEqual(order(), ['old0', 'old1', 'old2', 'new0']);
+      assert.equal((store.readSession('agent-a', 's1', 'cursor')?.[3] as { text: string }).text, 'part+more');
+    });
+
+    it('a correctly numbered append is written exactly as sent', () => {
+      seed(3);
+      const stored = store.appendMessages('agent-a', 's1', [human('new0', 3), human('new1', 4)], 'cursor', 1);
+      assert.deepEqual(stored.map(m => m.flatIndex), [3, 4]);
+      assert.deepEqual(order(), ['old0', 'old1', 'old2', 'new0', 'new1']);
+    });
+
+    it('a full re-projection that legitimately shifts rows is not renumbered (patch-all)', () => {
+      seed(3);
+      // An earlier message shows up late: it takes slot 1 and everything after it moves down by one.
+      const projection = [human('old0', 0), human('mid', 1), human('old1', 2), human('old2', 3)];
+      const stored = store.appendMessages('agent-a', 's1', projection, 'cursor', 1);
+      assert.deepEqual(stored.map(m => m.flatIndex), [0, 1, 2, 3]);
+      assert.deepEqual(order(), ['old0', 'mid', 'old1', 'old2']);
+    });
+
+    it('duplicates inside one batch do not stack on the same slot', () => {
+      seed(2);
+      const stored = store.appendMessages('agent-a', 's1', [human('n0', 7), human('n1', 7)], 'cursor', 1);
+      assert.deepEqual(stored.map(m => m.flatIndex), [7, 8]);
+      assert.deepEqual(order(), ['old0', 'old1', 'n0', 'n1']);
+    });
+  });
+
   it('keeps the body stream seq per session (full resets, append advances)', () => {
     const appendMessage: ChatElement = { type: 'assistant', id: 'a1', flatIndex: 1, text: 'yo' };
     store.writeSession(
