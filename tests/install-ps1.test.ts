@@ -157,13 +157,43 @@ describe('install.ps1', () => {
     assert.doesNotMatch(src, /SetEnvironmentVariable\('Path',\s*\$env:Path/);
   });
 
-  it('detects an upgrade and points at a daemon restart instead of re-login', () => {
+  it('starts the new shim on upgrade and does not hint a daemon install', () => {
     const src = text();
     assert.match(src, /Updated:/);
-    assert.match(src, /lifeline daemon install/);
+    assert.doesNotMatch(src, /lifeline daemon install/);
     assert.match(src, /lifeline setup --server-url/);
     assert.match(src, /uninstall\.ps1/);
     assert.match(src, /PowerShell/);
+    const pathUpdate = src.indexOf('$env:Path = $env:Path');
+    const startAt = src.search(/& \$shimPath start/);
+    assert.ok(pathUpdate >= 0, 'session PATH update');
+    assert.ok(startAt > pathUpdate, 'start runs after the session PATH is updated');
+    const shimAssign = src.indexOf('$shimPath = Join-Path $binDir \'lifeline.cmd\'');
+    assert.ok(shimAssign >= 0 && shimAssign < startAt, 'start uses the shim under $binDir');
+    const upgrade = src.slice(src.indexOf('if ($wasInstalled)'));
+    assert.match(src, /\$wasInstalled = \(Test-Path -LiteralPath \$mjsPath\) -and \(Test-Path -LiteralPath \$configPath\)/);
+    assert.match(upgrade, /Remove-Item Env:LIFELINE_SUPERVISED/);
+    assert.match(upgrade, /Remove-Item Env:INVOCATION_ID/);
+    assert.match(upgrade, /& \$shimPath start/);
+    const startFail = upgrade.match(/& \$shimPath start[\s\S]{0,500}/);
+    assert.ok(startFail, 'upgrade path must invoke the shim');
+    assert.match(startFail[0], /\$LASTEXITCODE -ne 0[\s\S]*?Fail /);
+    assert.doesNotMatch(startFail[0], /left in place/);
+    assert.match(startFail[0], /run this command again/);
+    // Rollback still restarts the previous task. The success path must not.
+    assert.equal((src.match(/^\s*Start-DaemonQuiet\s*$/gm) ?? []).length, 2);
+    const catchAt = src.indexOf('} catch {');
+    const firstQuiet = src.search(/^\s*Start-DaemonQuiet\s*$/m);
+    assert.ok(catchAt >= 0 && firstQuiet > catchAt, 'Start-DaemonQuiet stays on the rollback path');
+  });
+
+  it('does not claim the previous runtime survived a failed start after the swap', () => {
+    const src = text();
+    const branch = src.match(/if \(\$script:swapped\) \{[\s\S]*?\n {2}\}/);
+    assert.ok(branch, 'post-swap failure has its own throw');
+    assert.doesNotMatch(branch[0], /left in place/);
+    assert.match(branch[0], /run this command again/);
+    assert.match(src, /throw 'lifeline install did not complete -- the existing runtime was left in place'/);
   });
 
   it('does not leak $ErrorActionPreference into the caller session (irm | iex runs in-session)', () => {

@@ -48,14 +48,10 @@ export function uninstallCommand(origin = window.location.origin, os: InstallOs 
 }
 
 /**
- * Upgrade command. Deliberately not `lifeline update`: that requires a new enough CLI, and this
- * command is for machines that are **already behind**. Re-running install.sh replaces the runtime,
- * but the daemon is still on old code (path unchanged), so a daemon install must follow for it to take effect.
- *
- * On Windows, chain with `;` not `&&` — **PowerShell 5.1 has no `&&`** (that's PS 7 syntax);
- * pasting into older PowerShell is a syntax error.
+ * Upgrade command. Same string as `installCommand` and nothing else: the script
+ * itself runs `start` on the new CLI, so a suffix would run a second time and a
+ * PATH `lifeline` can be the wrong binary.
  */
 export function updateCommand(origin = window.location.origin, os: InstallOs = getInstallOs()): string {
-  const install = installCommand(origin, os);
-  return os === 'windows' ? `${install}; lifeline daemon install` : `${install} && lifeline daemon install`;
+  return installCommand(origin, os);
 }

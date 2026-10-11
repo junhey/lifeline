@@ -39,15 +39,16 @@ lifeline setup --server-url http://<your-lifeline-server>
 | 命令 | 作用 |
 |---|---|
 | `lifeline setup --server-url <url>` | 浏览器登录并拉起 agent |
+| `lifeline start` | 确保后台 agent 在跑 |
+| `lifeline start --foreground` | 前台调试运行 |
 | `lifeline status` | 体检：版本、配置、CDP、服务器连通性 |
 | `lifeline update` | 升级到最新版（`--force` 强制重装） |
 | `lifeline stop` | 停守护进程，但保留安装 |
-| `lifeline daemon install` / `uninstall` / `status` | 守护进程的装 / 卸 / 看 |
-| `lifeline start` | 前台跑 agent（调试用） |
+| `lifeline uninstall` | 卸掉后台服务（保留 ~/.lifeline 和 CLI） |
 | `lifeline open` | 打开网页控制台 |
 | `lifeline config path` | 打印配置文件位置 |
 
-`lifeline status` 会与最新版比对，落后即提示 `lifeline update`。重跑 `install.sh` 也算升级，但要守护进程跑上新代码需 `lifeline daemon install` 重启。
+`lifeline status` 会与最新版比对，落后即提示 `lifeline update`。
 
 ## 卸载
 
@@ -55,7 +56,7 @@ lifeline setup --server-url http://<your-lifeline-server>
 curl -fsSL http://<your-lifeline-server>/public/uninstall.sh | sh
 ```
 
-`lifeline stop` 只停不卸；`lifeline daemon uninstall` 才卸守护进程。
+`lifeline stop` 只停不卸；`lifeline uninstall` 卸掉后台服务。
 
 ## 架构
 

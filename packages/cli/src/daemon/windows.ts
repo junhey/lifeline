@@ -1,32 +1,163 @@
+import type { DaemonProbe } from '../commands/daemon.js';
 import type { DaemonOpts, DaemonOutcome } from '../ui.js';
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { BUILD_VERSION } from '../build-version.js';
 import { applyCodeBuddyCdpArgv, applyCursorCdpArgv, revertCodeBuddyCdpArgvIfManaged, revertCursorCdpArgvIfManaged } from '../cdp-argv-state.js';
 import { CONFIG_DIR, loadCliConfig, LOG_DIR, saveCliConfig } from '../config.js';
 import { rebuildSqliteFor } from '../installer.js';
 import { log, requireConfig, resolveCliEntry } from '../ui.js';
 import {
   isUnlimitedExecution,
-  newLifelinePids,
   parseWindowsAgentPids,
   parseWindowsTaskStatus,
+  pollNewLifelinePids,
   queryWindowsStatement,
   runWindowsStatement,
+  startWindowsDaemon,
   stopWindowsDaemon,
   WINDOWS_DAEMON_SCRIPT_NAME,
   WINDOWS_DAEMON_TASK,
-  windowsAgentProbePsCommand,
+  windowsDaemonScript,
   windowsLifelinePidsPsCommand,
   windowsRegisterPsCommand,
   windowsStatusPsCommand,
   windowsUnregisterPsCommand,
   writeWindowsDaemonScript,
 } from '../win-daemon.js';
-import { pidAlive, readUnixDaemonPid, startDetachedAgent, unixDaemonPidPath } from './systemd.js';
+import { lifelinePidsExcept, listedLifelineAgentPids, stopLifelinePid } from './agent-processes.js';
+import { decideEnsure } from './ensure-decision.js';
+import { readServiceVersion, writeServiceVersion } from './service-version.js';
+import { clearStalePidfile, pidAlive, pidfileAgentUp, pidfileServicePid, probePidfileRegistration, readUnixDaemonPid, startDetachedAgent, unixDaemonPidPath, unreadableLivePidfile } from './systemd.js';
 
 /** On-disk path of the supervisor script (counterpart of Linux's unit and macOS's plist). */
 export function windowsDaemonScriptPath(): string {
   return join(CONFIG_DIR, WINDOWS_DAEMON_SCRIPT_NAME);
+}
+
+/** The writer prefixes a BOM so PowerShell 5.1 reads UTF-8. Compare the script text without it. */
+function stripBom(text: string): string {
+  return text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text;
+}
+
+function windowsScriptMatches(nodeBin: string, cliEntry: string): boolean {
+  const scriptPath = windowsDaemonScriptPath();
+  if (!existsSync(scriptPath))
+    return false;
+  try {
+    return stripBom(readFileSync(scriptPath, 'utf-8')) === stripBom(windowsDaemonScript(nodeBin, cliEntry));
+  }
+  catch {
+    return false;
+  }
+}
+
+function executionLimitNote(limit: string | undefined): string | undefined {
+  if (limit && !isUnlimitedExecution(limit))
+    return `ExecutionTimeLimit is ${limit} (expected PT0S/00:00:00): the scheduler will kill the agent.`;
+  return undefined;
+}
+
+export function probeWindowsDaemon(): DaemonProbe {
+  const task = parseWindowsTaskStatus(queryWindowsStatement(windowsStatusPsCommand()));
+  const note = executionLimitNote(task.executionTimeLimit);
+  if (task.state) {
+    const cliEntry = resolveCliEntry();
+    const probe: DaemonProbe = {
+      installed: true,
+      running: task.running,
+      registrationMatches: cliEntry != null && windowsScriptMatches(process.execPath, cliEntry),
+    };
+    if (note)
+      probe.note = note;
+    return probe;
+  }
+  // No scheduled task: the pidfile process is the registration. A missing task is not
+  // "not installed" while that process is still alive.
+  const pidProbe = probePidfileRegistration();
+  if (!note)
+    return pidProbe;
+  return { ...pidProbe, note };
+}
+
+/**
+ * Node pids under the scheduled-task supervisor (powershell running this daemon.ps1).
+ * `null` when the process query itself failed — the caller must not treat that as "no service agent".
+ */
+function windowsTaskAgentPids(scriptPath: string): number[] | null {
+  const script = scriptPath.replace(/'/g, '\'\'');
+  const stdout = queryWindowsStatement([
+    `$script = '${script}'`,
+    `$map = @{}`,
+    `foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) { $map[[int]$p.ProcessId] = $p }`,
+    `$agents = @()`,
+    `foreach ($p in @($map.Values)) {`,
+    `  if ($p.Name -ne 'node.exe' -or -not $p.CommandLine -or $p.CommandLine -notlike '*lifeline.mjs*') { continue }`,
+    `  $cur = [int]$p.ProcessId`,
+    `  $guard = 0`,
+    `  $hit = $false`,
+    `  while ($guard -lt 6 -and -not $hit -and $map.ContainsKey($cur)) {`,
+    `    $proc = $map[$cur]`,
+    `    if ($proc.CommandLine -and $proc.CommandLine.ToLower().Contains($script.ToLower())) { $hit = $true }`,
+    `    else { $cur = [int]$proc.ParentProcessId; $guard++ }`,
+    `  }`,
+    `  if ($hit) { $agents += [int]$p.ProcessId }`,
+    `}`,
+    `'agent=' + (($agents | Select-Object -Unique) -join ',')`,
+  ].join('; '));
+  if (!stdout.includes('agent='))
+    return null;
+  return parseWindowsAgentPids(stdout);
+}
+
+/** Lifeline node pids that are not the scheduled-task agent. `null` when the task tree could not be read. */
+function lifelinePidsOutsideTask(scriptPath: string): number[] | null {
+  const service = windowsTaskAgentPids(scriptPath);
+  if (service == null)
+    return null;
+  const servicePids = new Set(service);
+  return listedLifelineAgentPids(
+    queryWindowsStatement(windowsLifelinePidsPsCommand(process.pid)),
+  ).filter(pid => !servicePids.has(pid));
+}
+
+function finishWindows(opts: DaemonOpts, outcome: DaemonOutcome, lines: string[]): DaemonOutcome {
+  if (opts.quiet)
+    return outcome;
+  for (const line of lines)
+    log(line);
+  for (const note of outcome.notes)
+    log(`  note   ${note}`);
+  return outcome;
+}
+
+function blockedByAgent(opts: DaemonOpts, pids: number[]): DaemonOutcome {
+  const summary = `another lifeline agent is already running (pid ${pids.join(', ')})`;
+  return finishWindows(opts, { ok: false, summary, notes: [] }, [
+    `Could not start ${WINDOWS_DAEMON_TASK}.`,
+    `  ${summary}`,
+  ]);
+}
+
+/** The task was stopped for the swap and Start-ScheduledTask returned false. Do not report it as running. */
+function taskDidNotStart(opts: DaemonOpts, detail?: string): DaemonOutcome {
+  const lines = [
+    `Could not start ${WINDOWS_DAEMON_TASK}.`,
+    '  the scheduled task did not start',
+  ];
+  if (detail)
+    lines.push(`  ${detail}`);
+  return finishWindows(opts, {
+    ok: false,
+    summary: 'the scheduled task did not start',
+    notes: [],
+  }, lines);
+}
+
+function applyIdeArgv(): void {
+  const cfg = loadCliConfig();
+  if (cfg)
+    saveCliConfig(applyCodeBuddyCdpArgv(applyCursorCdpArgv(cfg).config).config);
 }
 
 /**
@@ -38,7 +169,7 @@ export function windowsDaemonScriptPath(): string {
  * **Cannot rely on `RestartOnFailure`**: measured, it never restarts on a non-zero exit (see the top of `win-daemon.ts`).
  * Self-healing comes from the supervisor script's own loop.
  */
-export function cmdDaemonWindows(action: string, opts: DaemonOpts = {}): DaemonOutcome | undefined {
+export function cmdDaemonWindows(action: string, opts: DaemonOpts = {}, probe?: DaemonProbe): DaemonOutcome | undefined {
   const scriptPath = windowsDaemonScriptPath();
   const pidPath = unixDaemonPidPath();
 
@@ -50,7 +181,159 @@ export function cmdDaemonWindows(action: string, opts: DaemonOpts = {}): DaemonO
       process.exit(1);
     }
     const nodeBin = process.execPath;
+    const seen = probe ?? probeWindowsDaemon();
+    const ensure = decideEnsure({
+      installed: seen.installed,
+      registrationMatches: seen.registrationMatches,
+      running: seen.running,
+      versionMatches: readServiceVersion() === BUILD_VERSION,
+    });
+    if (ensure === 'noop') {
+      return finishWindows(opts, {
+        ok: true,
+        summary: `already running (scheduled task ${WINDOWS_DAEMON_TASK})`,
+        notes: seen.note ? [seen.note] : [],
+      }, [
+        `Already running: ${WINDOWS_DAEMON_TASK}`,
+        `  script ${scriptPath}`,
+        `  logs   ${join(LOG_DIR, 'agent.out.log')}`,
+        'Check with: lifeline status',
+      ]);
+    }
+
+    // Before stopWindowsDaemon and before Start-ScheduledTask. An unreadable live
+    // pidfile is not stale: do not stop the task and do not start a second agent.
+    const unreadPid = unreadableLivePidfile();
+    if (unreadPid != null) {
+      return finishWindows(opts, {
+        ok: false,
+        summary: `could not read the command line of the pidfile agent (pid ${unreadPid})`,
+        notes: [],
+      }, [
+        `Could not start ${WINDOWS_DAEMON_TASK}.`,
+        `  could not read the command line of the pidfile agent (pid ${unreadPid})`,
+      ]);
+    }
+
+    /**
+     * Spawn the pidfile fallback. SIGTERM a live `lifeline.mjs` first on restart/reinstall.
+     * A probe that says not installed has nothing to kill — delete a stale pidfile and spawn.
+     * Never spawn beside a lifeline process that is not this pidfile.
+     */
+    function startPidfileAgent(entry: string, notes: string[]): { ok: boolean; summary: string; blocked?: number[] } {
+      const unread = unreadableLivePidfile();
+      if (unread != null) {
+        return {
+          ok: false,
+          summary: `could not read the command line of the pidfile agent (pid ${unread})`,
+        };
+      }
+      const servicePid = pidfileServicePid();
+      const foreign = lifelinePidsExcept(servicePid);
+      if (foreign.length > 0)
+        return { ok: false, summary: 'not started', blocked: foreign };
+      if (servicePid != null && !stopLifelinePid(servicePid))
+        return { ok: false, summary: 'not started', blocked: [servicePid] };
+      clearStalePidfile();
+      const pid = startDetachedAgent(entry);
+      if (pid)
+        writeFileSync(pidPath, `${pid}\n`);
+      const up = pidfileAgentUp(pid);
+      if (up)
+        writeServiceVersion(BUILD_VERSION);
+      if (!pid)
+        notes.push('retry by hand: lifeline start');
+      return {
+        ok: Boolean(pid) && up,
+        summary: up && pid ? `started in the background (pid ${pid})` : 'not started',
+      };
+    }
+
+    const task = parseWindowsTaskStatus(queryWindowsStatement(windowsStatusPsCommand()));
+    if (task.state && ensure === 'start-only') {
+      const before = listedLifelineAgentPids(
+        queryWindowsStatement(windowsLifelinePidsPsCommand(process.pid)),
+      );
+      if (before.length > 0)
+        return blockedByAgent(opts, before);
+      const started = startWindowsDaemon();
+      const fresh = pollNewLifelinePids({
+        before,
+        list: () => listedLifelineAgentPids(
+          queryWindowsStatement(windowsLifelinePidsPsCommand(process.pid)),
+        ),
+      });
+      if (started && fresh.length > 0)
+        writeServiceVersion(BUILD_VERSION);
+      const notes: string[] = [];
+      if (seen.note)
+        notes.push(seen.note);
+      const agentUp = started && fresh.length > 0;
+      const summary = !started
+        ? 'not started'
+        : agentUp
+          ? `started (scheduled task ${WINDOWS_DAEMON_TASK})`
+          : 'scheduled task running; the agent process was not visible yet';
+      if (!started) {
+        notes.push('retry by hand: lifeline start');
+      }
+      else if (!agentUp) {
+        notes.push('the agent process was not visible yet — check lifeline status');
+      }
+      return finishWindows(opts, { ok: started, summary, notes }, [
+        !started
+          ? `Could not start ${WINDOWS_DAEMON_TASK}.`
+          : agentUp
+            ? `Started: ${WINDOWS_DAEMON_TASK}`
+            : `${WINDOWS_DAEMON_TASK} is running; the agent process was not visible yet. Check: lifeline status`,
+        `  script ${scriptPath}`,
+        `  logs   ${join(LOG_DIR, 'agent.out.log')}`,
+        'Check with: lifeline status',
+      ]);
+    }
+
+    if (!task.state && ensure === 'restart-in-place') {
+      const notes: string[] = ['no scheduled task here, so it is not restarted after a crash'];
+      const spawned = startPidfileAgent(cliEntry, notes);
+      if (spawned.blocked)
+        return blockedByAgent(opts, spawned.blocked);
+      return finishWindows(opts, { ok: spawned.ok, summary: spawned.summary, notes }, [
+        spawned.ok ? 'Restarted the background agent.' : `Could not start ${WINDOWS_DAEMON_TASK}.`,
+        `  logs   ${join(LOG_DIR, 'agent.out.log')}`,
+        'Check with: lifeline status',
+      ]);
+    }
+
+    if (!task.state) {
+      const unread = unreadableLivePidfile();
+      if (unread != null) {
+        return finishWindows(opts, {
+          ok: false,
+          summary: `could not read the command line of the pidfile agent (pid ${unread})`,
+          notes: [],
+        }, [
+          `Could not start ${WINDOWS_DAEMON_TASK}.`,
+          `  could not read the command line of the pidfile agent (pid ${unread})`,
+        ]);
+      }
+      const servicePid = pidfileServicePid();
+      const foreign = lifelinePidsExcept(servicePid);
+      if (foreign.length > 0)
+        return blockedByAgent(opts, foreign);
+      if (servicePid != null && !stopLifelinePid(servicePid))
+        return blockedByAgent(opts, [servicePid]);
+      clearStalePidfile();
+    }
+
     const notes: string[] = [];
+    const taskWasRunning = Boolean(task.state && task.running);
+    // A foreground agent is not the service. Refuse before stop so the task is not left stopped.
+    // The service's own node is excluded and is still replaced by the stop-then-register below.
+    if (task.state) {
+      const outside = lifelinePidsOutsideTask(scriptPath);
+      if (outside != null && outside.length > 0)
+        return blockedByAgent(opts, outside);
+    }
     /**
      * Stop the previous daemon cleanly first — and it must happen before writing the script / registering.
      *
@@ -73,26 +356,33 @@ export function cmdDaemonWindows(action: string, opts: DaemonOpts = {}): DaemonO
      * `excludePid: process.pid` cannot be omitted: the CLI's own command line is
      * `node.exe …lifeline.mjs daemon install`, which also matches the probe criterion (found in code review on a real machine).
      */
-    const pidsBefore = parseWindowsAgentPids(
+    const pidsBefore = listedLifelineAgentPids(
       queryWindowsStatement(windowsLifelinePidsPsCommand(process.pid)),
     );
     if (pidsBefore.length > 0) {
-      notes.push(
-        `another lifeline agent is already running (pid ${pidsBefore.join(', ')}); it may hold the logs — stop it with \`lifeline stop\``,
-      );
+      if (taskWasRunning && !startWindowsDaemon()) {
+        return taskDidNotStart(
+          opts,
+          `another lifeline agent is already running (pid ${pidsBefore.join(', ')})`,
+        );
+      }
+      return blockedByAgent(opts, pidsBefore);
     }
-    const sqliteError = rebuildSqliteFor(nodeBin);
-    if (sqliteError)
-      notes.push(`better-sqlite3 rebuild failed (${sqliteError}); chat history may be unavailable.`);
-    mkdirSync(LOG_DIR, { recursive: true });
 
-    // UTF-8 with BOM: the script embeds a path that may not be ASCII (Chinese username).
-    writeWindowsDaemonScript(scriptPath, nodeBin, cliEntry);
+    if (ensure === 'reinstall') {
+      const sqliteError = rebuildSqliteFor(nodeBin);
+      if (sqliteError)
+        notes.push(`better-sqlite3 rebuild failed (${sqliteError}); chat history may be unavailable.`);
+      // UTF-8 with BOM: the script embeds a path that may not be ASCII (Chinese username).
+      writeWindowsDaemonScript(scriptPath, nodeBin, cliEntry);
+    }
+    mkdirSync(LOG_DIR, { recursive: true });
 
     let ok = runWindowsStatement(windowsRegisterPsCommand({ scriptPath }));
     let summary: string;
     /** Task running ≠ agent running: only a new pid in the process-table set-difference counts as actually up. */
     let agentUp = true;
+    let taskReportsRunning = false;
     if (ok) {
       summary = `started (scheduled task ${WINDOWS_DAEMON_TASK})`;
       // Read-back check: ExecutionTimeLimit defaults to 72 hours; the agent would vanish **silently** after three days.
@@ -102,57 +392,65 @@ export function cmdDaemonWindows(action: string, opts: DaemonOpts = {}): DaemonO
           `ExecutionTimeLimit is ${status.executionTimeLimit} (expected PT0S/00:00:00): the scheduler will kill the agent.`,
         );
       }
-      if (!status.running) {
-        notes.push('the task is registered but did not report Running yet; check `lifeline daemon status`.');
-      }
-      // Task Running only means the **supervisor** is running — the agent itself may fail at the launch layer every round (see
-      // supervisor.log in the supervisor script). Wait a few seconds, look at the process table, **set-difference against the before-start snapshot**, and don't report "didn't
-      // actually come up" as Installed and started (hit on a real machine: the user thought the upgrade finished, but the running process was still the old one,
-      // and the web page kept saying "update available").
-      const fresh = newLifelinePids(
-        pidsBefore,
-        parseWindowsAgentPids(
-          queryWindowsStatement(windowsAgentProbePsCommand({ excludePid: process.pid })),
+      taskReportsRunning = Boolean(status.running);
+      if (!status.running)
+        notes.push('the task is registered but did not report Running yet; check `lifeline status`.');
+      // Task Running only means the supervisor is running. Cold start on a real machine
+      // (PowerShell 5.1 plus Defender scanning the new script) can take about 10s, so a
+      // single 3s snapshot misses and the missing version stamp makes the next start restart.
+      const fresh = pollNewLifelinePids({
+        before: pidsBefore,
+        list: () => listedLifelineAgentPids(
+          queryWindowsStatement(windowsLifelinePidsPsCommand(process.pid)),
         ),
-      );
+      });
       if (fresh.length === 0) {
         agentUp = false;
-        summary = 'installed, but the agent process did not come up';
-        notes.push(
-          `the agent process did not come up — check ${LOG_DIR}; if the launch itself failed, supervisor.log says why`,
-        );
+        if (taskReportsRunning) {
+          summary = 'scheduled task running; the agent process was not visible yet';
+          notes.push('the agent process was not visible yet — check lifeline status');
+        }
+        else {
+          summary = 'installed, but the agent process did not come up';
+          notes.push(
+            `the agent process did not come up — check ${LOG_DIR}; if the launch itself failed, supervisor.log says why`,
+          );
+        }
+      }
+      else {
+        writeServiceVersion(BUILD_VERSION);
       }
     }
     else {
-      const pid = startDetachedAgent(cliEntry);
-      if (pid)
-        writeFileSync(pidPath, `${pid}\n`);
-      ok = Boolean(pid);
-      summary = pid ? `started in the background (pid ${pid})` : 'not started';
       notes.push('the scheduled task could not be registered, so it is not restarted after a crash');
-      if (!pid)
-        notes.push('retry by hand: lifeline daemon install');
+      const spawned = startPidfileAgent(cliEntry, notes);
+      // Unreadable command line and a detached process that did not come up have no
+      // blocked list. The task was already stopped; put it back before any failure return.
+      if (!spawned.ok && taskWasRunning && !startWindowsDaemon())
+        return taskDidNotStart(opts, spawned.summary);
+      if (spawned.blocked)
+        return blockedByAgent(opts, spawned.blocked);
+      ok = spawned.ok;
+      agentUp = spawned.ok;
+      summary = spawned.summary;
     }
 
-    const cfg = loadCliConfig();
-    if (cfg)
-      saveCliConfig(applyCodeBuddyCdpArgv(applyCursorCdpArgv(cfg).config).config);
-
-    const outcome: DaemonOutcome = { ok, summary, notes };
-    if (opts.quiet)
-      return outcome;
+    if (ensure === 'reinstall')
+      applyIdeArgv();
 
     // Spell out the three exits separately; don't paper over "didn't come up" with a single "Installed and started".
-    if (!ok)
-      log(`Could not start ${WINDOWS_DAEMON_TASK}.`);
-    else if (agentUp)
-      log(`Installed and started: ${WINDOWS_DAEMON_TASK}`);
-    else log(`Installed ${WINDOWS_DAEMON_TASK}, but the agent is not running.`);
-    log(`  script ${scriptPath}`);
-    log(`  logs   ${join(LOG_DIR, 'agent.out.log')}`);
-    log('Check with: lifeline daemon status');
-    for (const note of notes) log(`  note   ${note}`);
-    return outcome;
+    return finishWindows(opts, { ok, summary, notes }, [
+      !ok
+        ? `Could not start ${WINDOWS_DAEMON_TASK}.`
+        : agentUp
+          ? `Installed and started: ${WINDOWS_DAEMON_TASK}`
+          : taskReportsRunning
+            ? `${WINDOWS_DAEMON_TASK} is running; the agent process was not visible yet. Check: lifeline status`
+            : `Installed ${WINDOWS_DAEMON_TASK}, but the agent is not running.`,
+      `  script ${scriptPath}`,
+      `  logs   ${join(LOG_DIR, 'agent.out.log')}`,
+      'Check with: lifeline status',
+    ]);
   }
 
   if (action === 'uninstall') {
@@ -175,26 +473,6 @@ export function cmdDaemonWindows(action: string, opts: DaemonOpts = {}): DaemonO
       unlinkSync(pidPath);
     revertCursorCdpArgvIfManaged();
     revertCodeBuddyCdpArgvIfManaged();
-    return;
-  }
-
-  if (action === 'status') {
-    const status = parseWindowsTaskStatus(queryWindowsStatement(windowsStatusPsCommand()));
-    const pid = readUnixDaemonPid(pidPath);
-    const bgAlive = Boolean(pid && pidAlive(pid));
-    if (status.state) {
-      // 267009 is "currently running", not an error — parseWindowsTaskStatus already translated it
-      log(`daemon   ${status.state}${status.running ? ' (running)' : ''}`);
-      if (status.executionTimeLimit && !isUnlimitedExecution(status.executionTimeLimit)) {
-        log(`  note   ExecutionTimeLimit is ${status.executionTimeLimit} (expected PT0S/00:00:00)`);
-      }
-    }
-    if (bgAlive)
-      log(`daemon   running in background (pid ${pid})`);
-    else if (pid)
-      unlinkSync(pidPath);
-    if (!status.state && !bgAlive)
-      log('daemon   not installed (run: lifeline daemon install)');
     return;
   }
 

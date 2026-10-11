@@ -89,7 +89,7 @@ export function MachineRowMenu({ machine }: { machine: MachineInfo }) {
             <PanelBack onClick={closePanel} />
             <div className="mb-1 font-semibold">更新这台电脑</div>
             <div className="mb-2.5 text-[length:var(--text-chrome)] text-[var(--text-weak)]">
-              在该电脑上执行：下载新版 CLI，并重启守护进程生效。
+              在该电脑上执行这一条：换上新的 CLI，并让后台 agent 跑这份代码。
               {machine.cliVersion && (
                 <>
                   {' '}
@@ -118,7 +118,7 @@ export function MachineRowMenu({ machine }: { machine: MachineInfo }) {
             <PanelBack onClick={closePanel} />
             <div className="mb-1 font-semibold">卸载这台电脑</div>
             <div className="mb-2.5 text-[length:var(--text-chrome)] text-[var(--text-weak)]">
-              在该电脑上执行：守护进程停止运行，并撤销 IDE 启动参数（CDP）。
+              在该电脑上执行：停止后台 agent，撤销受管的 IDE 调试参数，并删除配置和 CLI。
             </div>
             {machineOs === undefined && <OsSwitch />}
             <CommandBlock cmd={uninstallCommand(undefined, os)} hint={osHint} reserveHint={machineOs === undefined} />

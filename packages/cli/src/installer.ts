@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import { statSync } from 'node:fs';
 import { join } from 'node:path';
 import { rebuildBetterSqlite3, resolveNpmCli } from '../../agent/src/ensure-sqlite.js';
 import { CONFIG_DIR } from './config.js';
@@ -65,7 +66,7 @@ export function installerInvocation(platform: NodeJS.Platform = process.platform
  * must stay in one place. Env vars are passed through, so a custom
  * LIFELINE_BIN_DIR still lands in the same place.
  */
-export async function runInstaller(base: string, env: NodeJS.ProcessEnv): Promise<void> {
+export async function runInstaller(base: string, env: NodeJS.ProcessEnv): Promise<number> {
   const scriptName = installerScriptName();
   const url = `${base}${PUBLIC_PREFIX}/${scriptName}`;
   let script: string;
@@ -86,10 +87,51 @@ export async function runInstaller(base: string, env: NodeJS.ProcessEnv): Promis
     stdio: ['pipe', 'inherit', 'inherit'],
     env: installerEnv(env),
   });
-  if (result.status !== 0) {
-    console.error('Installer failed; the existing runtime was left in place.');
-    process.exit(1);
+  // A non-zero status is the caller's to judge: on Unix `start` runs under `set -e`
+  // after the new runtime is in place, so a failed start must not be reported as
+  // "the old runtime was left in place". null (killed by a signal) counts as non-zero.
+  return result.status ?? 1;
+}
+
+export interface BundleStamp {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  birthtimeMs: number;
+}
+
+/** Identity of the bundle file. A same-version `--force` reinstall keeps the version string and still changes this. */
+export function bundleStamp(path: string): BundleStamp | null {
+  try {
+    const st = statSync(path);
+    return {
+      dev: st.dev,
+      ino: st.ino,
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      ctimeMs: st.ctimeMs,
+      birthtimeMs: st.birthtimeMs,
+    };
   }
+  catch {
+    return null;
+  }
+}
+
+/** True when `path` now names a different file than the stamp taken before the installer. */
+export function bundleFileReplaced(before: BundleStamp | null, after: BundleStamp | null): boolean {
+  if (after == null)
+    return false;
+  if (before == null)
+    return true;
+  return before.dev !== after.dev
+    || before.ino !== after.ino
+    || before.size !== after.size
+    || before.mtimeMs !== after.mtimeMs
+    || before.ctimeMs !== after.ctimeMs
+    || before.birthtimeMs !== after.birthtimeMs;
 }
 
 /** Runs the freshly installed bundle once — the only proof that the swap worked. */

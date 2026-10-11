@@ -43,15 +43,17 @@ describe('command builders', () => {
     }
   });
 
-  it('chains the Windows update with a semicolon', () => {
-    assert.equal(updateCommand(O, 'windows'), `irm ${O}/public/install.ps1 | iex; lifeline daemon install`);
+  it('uses the install one-liner as the update command', () => {
+    assert.equal(updateCommand(O, 'unix'), installCommand(O, 'unix'));
+    assert.equal(updateCommand(O, 'windows'), installCommand(O, 'windows'));
+    assert.doesNotMatch(updateCommand(O, 'windows'), /&&/);
   });
 
-  // Production app.js copy: not a single character may change
-  it('keeps the unix commands byte-identical', () => {
+  // Install and uninstall stay the production one-liners. Update is that install line alone:
+  // the script runs `start` itself, so a suffix would run twice and a PATH `lifeline` can be the wrong binary.
+  it('keeps the unix install and uninstall commands byte-identical', () => {
     assert.equal(installCommand(O, 'unix'), `curl -fsSL ${O}/public/install.sh | sh`);
     assert.equal(uninstallCommand(O, 'unix'), `curl -fsSL ${O}/public/uninstall.sh | sh`);
-    assert.equal(updateCommand(O, 'unix'), `curl -fsSL ${O}/public/install.sh | sh && lifeline daemon install`);
   });
 
   // https→http downgrade is a deployment-specific special case (origin listens on 80 only),
@@ -109,7 +111,7 @@ describe('machineCommandOs', () => {
   it('gives a Windows machine the PowerShell commands even from a macOS console', () => {
     const os = machineCommandOs('win32');
     assert.equal(uninstallCommand(O, os), `irm ${O}/public/uninstall.ps1 | iex`);
-    assert.equal(updateCommand(O, os), `irm ${O}/public/install.ps1 | iex; lifeline daemon install`);
+    assert.equal(updateCommand(O, os), installCommand(O, os));
     assert.equal(installCommand(O, machineCommandOs('linux')), `curl -fsSL ${O}/public/install.sh | sh`);
   });
 });

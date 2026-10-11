@@ -2,7 +2,7 @@ import { BUILD_VERSION as VERSION } from './build-version.js';
 import { cmdDaemon } from './commands/daemon.js';
 import { cmdOpen } from './commands/open.js';
 import { cmdSetup } from './commands/setup.js';
-import { cmdStart } from './commands/start.js';
+import { cmdStart, runAgent } from './commands/start.js';
 import { cmdStatus } from './commands/status.js';
 import { cmdUpdate } from './commands/update.js';
 import { cliConfigPath } from './config.js';
@@ -14,11 +14,10 @@ const HELP = `Lifeline ${VERSION} — remote-control Cursor / CodeBuddy on your 
 Usage:
   lifeline setup --server-url <url>  Sign in via browser and start the agent
   lifeline setup                     Configure server URL + token (interactive)
-  lifeline start               Run the agent in the foreground
-  lifeline daemon install      Install as a background daemon (launchd/systemd)
-  lifeline daemon uninstall    Remove the background daemon
-  lifeline daemon status       Show daemon state
+  lifeline start                     Ensure the background agent
+  lifeline start --foreground | -f   Attached debug run
   lifeline stop                Stop the daemon, keep it installed
+  lifeline uninstall           Remove the background service (keeps ~/.lifeline and the CLI)
   lifeline status              Health check: version, config, IDE CDP, server
   lifeline update              Update to the latest release (--force to reinstall)
   lifeline open                Open the web client in your browser
@@ -56,12 +55,21 @@ async function main(): Promise<void> {
         parseCodeFlag(process.argv.slice(3)),
       );
       break;
+    case 'run':
+      await runAgent();
+      break;
     case 'start':
       await cmdStart();
       break;
     case 'stop':
       cmdStop();
       break;
+    case 'uninstall': {
+      const outcome = cmdDaemon('uninstall');
+      if (outcome && !outcome.ok)
+        process.exit(1);
+      break;
+    }
     case 'status':
       await cmdStatus();
       break;

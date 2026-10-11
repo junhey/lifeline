@@ -16,9 +16,9 @@ import {
 import { windowsDaemonScriptPath } from './windows.js';
 
 /** Stopped is not uninstalled: the plist / unit stays, so the next login brings it back. */
-const STOP_NOTE_KEPT = '  note   still installed: starts again at login, or run `lifeline daemon install`';
-/** A foreground `lifeline start` is not in launchd/systemd — say where it can be stopped. */
-const STOP_NOTE_FOREGROUND = '  note   `lifeline start` runs in the foreground — stop it there (Ctrl+C)';
+const STOP_NOTE_KEPT = '  note   still installed: starts again at login, or run `lifeline start`';
+/** A foreground `lifeline start --foreground` or `lifeline run` is not in launchd/systemd — say where it can be stopped. */
+const STOP_NOTE_FOREGROUND = '  note   `lifeline start --foreground` or `lifeline run` runs in the foreground — stop it there (Ctrl+C)';
 
 /**
  * `lifeline stop` — stop the background agent, keep it installed. The
@@ -47,7 +47,7 @@ export function cmdStop(): void {
   if (!launchdJobLoaded(serviceRef)) {
     log(installed
       ? `daemon   already stopped (launchd ${DAEMON_LABEL})`
-      : 'daemon   not installed (run: lifeline daemon install)');
+      : 'daemon   not installed (run: lifeline start)');
     log(installed ? STOP_NOTE_KEPT : STOP_NOTE_FOREGROUND);
     return;
   }
@@ -94,13 +94,13 @@ export function stopDaemonUnix(): void {
     }
     if (existsSync(pidPath))
       unlinkSync(pidPath);
-    log('  note   start it again with `lifeline daemon install`');
+    log('  note   start it again with `lifeline start`');
     return;
   }
 
   if (existsSync(pidPath))
     unlinkSync(pidPath);
-  log('daemon   not installed (run: lifeline daemon install)');
+  log('daemon   not installed (run: lifeline start)');
   log(STOP_NOTE_FOREGROUND);
 }
 
@@ -112,7 +112,7 @@ export function restartDaemon(): void {
     stopWindowsDaemon({ scriptPath: windowsDaemonScriptPath() });
     if (startWindowsDaemon())
       log(`Restarted ${WINDOWS_DAEMON_TASK}.`);
-    else log('Could not restart the daemon. Run: lifeline daemon install');
+    else log('Could not restart the daemon. Run: lifeline start');
     return;
   }
   if (process.platform !== 'darwin') {
@@ -121,7 +121,7 @@ export function restartDaemon(): void {
   }
   const plistPath = launchdPlistPath();
   if (!existsSync(plistPath)) {
-    log('No daemon installed. Start the agent with: lifeline daemon install');
+    log('No daemon installed. Start the agent with: lifeline start');
     return;
   }
   const uid = execSync('id -u').toString().trim();
@@ -130,7 +130,7 @@ export function restartDaemon(): void {
   // offline" is the most expensive kind of false success.
   if (kickstartLaunchd(`gui/${uid}/${DAEMON_LABEL}`).ok)
     log(`Restarted ${DAEMON_LABEL}.`);
-  else log(`Could not restart the daemon. Run: lifeline daemon install`);
+  else log(`Could not restart the daemon. Run: lifeline start`);
 }
 
 export function restartDaemonUnix(): void {
@@ -158,7 +158,7 @@ export function restartDaemonUnix(): void {
   }
   const cliEntry = resolveCliEntry();
   if (!cliEntry) {
-    log('No daemon installed. Start the agent with: lifeline daemon install');
+    log('No daemon installed. Start the agent with: lifeline start');
     return;
   }
   const started = startDetachedAgent(cliEntry);

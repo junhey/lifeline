@@ -189,6 +189,8 @@ describe('install.sh', () => {
     assert.match(shim, /^#!\/bin\/sh\n/);
     assert.match(shim, new RegExp(`exec "${shimPathForm(node)}" "${shimPathForm(mjs)}" "\\$@"`));
     assert.match(result.stdout, /lifeline setup --server-url/);
+    // Fixture node is `echo runtime-node` and only the shim runs it. A fresh install must not.
+    assert.doesNotMatch(result.stdout, /runtime-node/);
   });
 
   it('installs linux-x64 runtime and writes an absolute-path shim', () => {
@@ -244,17 +246,44 @@ describe('install.sh', () => {
     makePackage(baseDir, 'darwin-arm64');
     mkdirSync(join(libDir, 'runtime'), { recursive: true });
     writeFileSync(join(libDir, 'runtime', 'lifeline.mjs'), 'console.log("old")\n');
+    writeFileSync(join(libDir, 'config.json'), '{"serverUrl":"http://example","agentToken":"t"}\n');
     stubUname(stubDir, 'Darwin', 'arm64');
     const result = runInstall({ home, binDir, libDir, baseDir, stubDir });
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Updated: .*runtime\/lifeline\.mjs/);
-    assert.match(result.stdout, /lifeline daemon install/);
+    assert.doesNotMatch(result.stdout, /daemon install/);
     // An upgrade must not prompt to log in again
     assert.doesNotMatch(result.stdout, /Next, sign in/);
+    // The fixture node is `echo runtime-node`; only the shim runs it, once.
+    assert.equal(result.stdout.split('runtime-node').length - 1, 1);
+    assert.match(readFileSync(SCRIPT, 'utf-8'), /"\$BIN_DIR\/lifeline" start/);
+    assert.match(readFileSync(SCRIPT, 'utf-8'), /unset LIFELINE_SUPERVISED/);
+    assert.match(readFileSync(SCRIPT, 'utf-8'), /unset INVOCATION_ID/);
     assert.equal(
       readFileSync(join(libDir, 'runtime', 'lifeline.mjs'), 'utf-8'),
       'console.log("cli")\n',
     );
+  });
+
+  it('prints setup instead of start when the runtime exists and config.json does not', () => {
+    const home = join(tmp, 'home');
+    const binDir = join(tmp, 'bin');
+    const libDir = join(home, '.lifeline');
+    const baseDir = join(tmp, 'base');
+    const stubDir = join(tmp, 'stub');
+    mkdirSync(home, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(baseDir, { recursive: true });
+    mkdirSync(stubDir, { recursive: true });
+    makePackage(baseDir, 'darwin-arm64');
+    mkdirSync(join(libDir, 'runtime'), { recursive: true });
+    writeFileSync(join(libDir, 'runtime', 'lifeline.mjs'), 'console.log("old")\n');
+    stubUname(stubDir, 'Darwin', 'arm64');
+    const result = runInstall({ home, binDir, libDir, baseDir, stubDir });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /lifeline setup --server-url/);
+    assert.doesNotMatch(result.stdout, /Updated:/);
+    assert.doesNotMatch(result.stdout, /runtime-node/);
   });
 
   it('rejects unsupported uname without touching runtime', () => {

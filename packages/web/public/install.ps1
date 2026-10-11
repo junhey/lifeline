@@ -45,6 +45,9 @@ function Install-Lifeline {
   $ErrorActionPreference = 'Stop'
   # 5.1's progress bar makes Invoke-WebRequest roughly ten times slower.
   $ProgressPreference = 'SilentlyContinue'
+  # `irm | iex` keeps script scope in the caller session. Clear a leftover from
+  # an earlier run so a failure before this swap cannot reuse that flag.
+  $script:swapped = $false
 
   $taskName = 'Lifeline Agent'
   $package = 'lifeline-win32-x64.zip'
@@ -131,7 +134,11 @@ function Install-Lifeline {
   }
 
   # Read this before we touch anything: it decides what we print at the end.
-  $wasInstalled = Test-Path -LiteralPath $mjsPath
+  # A runtime without config.json has never finished setup. start would exit 1
+  # from requireConfig, so that machine gets the fresh-install instructions.
+  $configDir = Join-Path $env:USERPROFILE '.lifeline'
+  $configPath = Join-Path $configDir 'config.json'
+  $wasInstalled = (Test-Path -LiteralPath $mjsPath) -and (Test-Path -LiteralPath $configPath)
 
   # --- download -------------------------------------------------------------
   $tempRoot = [System.IO.Path]::GetTempPath()
@@ -208,7 +215,9 @@ function Install-Lifeline {
   # --- swap (Windows file locks) --------------------------------------------
   # A running node.exe cannot be deleted (Access denied), but it CAN be renamed,
   # so: stop daemon -> rename runtime to runtime.old -> move runtime.next into
-  # place -> start daemon -> delete runtime.old.
+  # place -> delete runtime.old -> write the new shim -> `lifeline start`.
+  # Do not Start-ScheduledTask before that shim exists: the task would come
+  # back on the previous registration.
   if (Test-Path -LiteralPath $runtimeDir) {
     Stop-DaemonQuiet
     # Sweep leftovers from earlier upgrades: both the plain runtime.old and any
@@ -232,6 +241,7 @@ function Install-Lifeline {
     Rename-Item -LiteralPath $runtimeDir -NewName 'runtime.old'
     try {
       Move-Item -LiteralPath $nextDir -Destination $runtimeDir
+      $script:swapped = $true
     } catch {
       # Roll back. Without this the CLI would dangle -- runtime has been renamed
       # away but the new one never landed -- and `lifeline` would be broken with
@@ -250,14 +260,13 @@ function Install-Lifeline {
       Start-DaemonQuiet
       Fail ('Cannot move the new runtime into place: ' + $detail)
     }
-    Start-DaemonQuiet
 
     # Best effort: if a file is still held we leave it; the sweep above retries.
     Remove-Item -LiteralPath $oldDir -Recurse -Force -ErrorAction SilentlyContinue
   } else {
-    # Fresh install: nothing to swap.
+    # Fresh install: nothing to swap, and nothing to start before setup.
     Move-Item -LiteralPath $nextDir -Destination $runtimeDir
-    Start-DaemonQuiet
+    $script:swapped = $true
   }
 
   # --- CLI shim -------------------------------------------------------------
@@ -296,8 +305,14 @@ function Install-Lifeline {
   Write-Host ''
   if ($wasInstalled) {
     Write-Host ('Updated: ' + $mjsPath)
-    Write-Host 'Restart the background agent so it runs the new version:'
-    Write-Host '  lifeline daemon install'
+    # Absolute path under $binDir: a PATH `lifeline` can be a different binary.
+    # A service shell can pass these in. The child start must not treat itself as the supervisor.
+    Remove-Item Env:LIFELINE_SUPERVISED -ErrorAction SilentlyContinue
+    Remove-Item Env:INVOCATION_ID -ErrorAction SilentlyContinue
+    & $shimPath start
+    if ($LASTEXITCODE -ne 0) {
+      Fail 'Could not start the background agent -- run this command again.'
+    }
   } else {
     Write-Host 'Next, sign in (opens a browser; no token to type):'
     Write-Host ('  lifeline setup --server-url ' + $base)
@@ -310,6 +325,7 @@ function Install-Lifeline {
     Write-Host ('  irm ' + $base + '/public/uninstall.ps1 | iex')
   }
   Write-Host ''
+  $script:swapped = $false
 }
 
 # `lifeline update` pipes THIS FILE into `powershell -Command -`, which consumes
@@ -335,5 +351,8 @@ try {
 Remove-Item function:Install-Lifeline -ErrorAction SilentlyContinue
 
 if ($installFailed) {
+  if ($script:swapped) {
+    throw 'lifeline start failed after the runtime swap -- run this command again'
+  }
   throw 'lifeline install did not complete -- the existing runtime was left in place'
 }

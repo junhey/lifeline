@@ -22,9 +22,11 @@ if [ "$BASE" = "__SERVER_ORIGIN""__" ]; then
   exit 1
 fi
 
-# Runtime already present = this is an upgrade, not a first install: the closing hint must become "restart the daemon",
-# otherwise after re-running curl the daemon is still on old code (path unchanged; no restart, no effect).
-if [ -f "$LIB_DIR/runtime/lifeline.mjs" ]; then
+# Runtime and ~/.lifeline/config.json already present = an upgrade. After the new
+# shim exists, run it as `start` by absolute path (set -e fails the script if that
+# exits non-zero). A runtime with no config has never finished setup: `start`
+# would exit 1 from requireConfig, so print the fresh-install instructions instead.
+if [ -f "$LIB_DIR/runtime/lifeline.mjs" ] && [ -f "$HOME/.lifeline/config.json" ]; then
   was_installed=1
 else
   was_installed=0
@@ -178,8 +180,12 @@ unset IFS
 echo ""
 if [ "$was_installed" = 1 ]; then
   echo "Updated: $LIB_DIR/runtime/lifeline.mjs"
-  echo "Restart the background agent so it runs the new version:"
-  echo "  lifeline daemon install"
+  # A service shell can pass these in. The child start must not treat itself as the supervisor.
+  (
+    unset LIFELINE_SUPERVISED
+    unset INVOCATION_ID
+    "$BIN_DIR/lifeline" start
+  )
   if [ -n "$other" ]; then
     echo ""
     echo "NOTE: another lifeline is on PATH ($other); the daemon uses $LIB_DIR/runtime."

@@ -6,6 +6,7 @@ import { formatCdpStatusLine, formatContentSourceLine, probeStatusCdp } from '..
 import { cliConfigPath } from '../config.js';
 import { log, requireConfig } from '../ui.js';
 import { fetchLatestVersion, updateHint } from '../version.js';
+import { daemonProbe, logDaemonStatus } from './daemon.js';
 
 export async function cmdStatus(): Promise<void> {
   const config = requireConfig();
@@ -42,6 +43,8 @@ export async function cmdStatus(): Promise<void> {
 
   await logCdpStatus('cursor', config.cdpUrl);
   await logCdpStatus('codebuddy', codebuddyCdpUrl);
+
+  logDaemonStatus(daemonProbe());
 
   try {
     const res = await fetch(`${config.serverUrl}/healthz`, { signal: AbortSignal.timeout(5000) });

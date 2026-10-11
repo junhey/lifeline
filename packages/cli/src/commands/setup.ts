@@ -235,9 +235,17 @@ export async function cmdSetup(serverUrlFlag?: string, codeFlag?: string): Promi
     for (const line of cdpArgvLines('CodeBuddy', codebuddy.state, resolveCodeBuddyArgvPath() ?? '', 0)) {
       detail(line);
     }
+
+    const daemon = startAgentAfterSetup();
+    row('daemon', daemon.summary);
+    for (const note of daemon.notes) detail(note);
     log('');
+
+    if (!daemon.ok) {
+      console.error('Setup is not complete: the agent is not running (see the daemon notes above).');
+      process.exit(1);
+    }
     row('next', 'lifeline status          check Cursor + server');
-    detail('lifeline daemon install   run it in the background');
   }
   finally {
     asker.close();
