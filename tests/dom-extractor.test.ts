@@ -510,7 +510,7 @@ describe('extractionFunction', () => {
         </div>
         <div class="agent-sidebar-cell" data-selected="false" data-composer-id="c-done">
           <div class="agent-sidebar-cell-icon"><div class="agent-sidebar-cell-icon-default"><div style="display: contents;"><span aria-label="Completed"><span class="ui-agent-status-dot" data-variant="done-seen"></span></span></div></div></div>
-          <div class="agent-sidebar-cell-text">WOA and Lifeline sync</div>
+          <div class="agent-sidebar-cell-text">Lifeline agent sync</div>
         </div>
       </div>
     `);
