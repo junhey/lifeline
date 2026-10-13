@@ -17,8 +17,12 @@ import { windowsDaemonScriptPath } from './windows.js';
 
 /** Stopped is not uninstalled: the plist / unit stays, so the next login brings it back. */
 const STOP_NOTE_KEPT = '  note   still installed: starts again at login, or run `lifeline start`';
-/** A foreground `lifeline start --foreground` or `lifeline run` is not in launchd/systemd — say where it can be stopped. */
-const STOP_NOTE_FOREGROUND = '  note   `lifeline start --foreground` or `lifeline run` runs in the foreground — stop it there (Ctrl+C)';
+/**
+ * A foreground `lifeline start --foreground` or `lifeline run` is not in launchd/systemd — say where it
+ * can be stopped. Exported because `lifeline status` cannot tell a foreground process from the service
+ * either (same command line): reusing this wording beats inventing a second phrase for one situation.
+ */
+export const STOP_NOTE_FOREGROUND = '  note   `lifeline start --foreground` or `lifeline run` runs in the foreground — stop it there (Ctrl+C)';
 
 /**
  * `lifeline stop` — stop the background agent, keep it installed. The

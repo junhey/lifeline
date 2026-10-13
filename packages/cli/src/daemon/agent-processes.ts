@@ -1,46 +1,87 @@
 import { execFileSync, execSync } from 'node:child_process';
 import {
+  AGENT_SOURCE_ENTRY_TOKENS,
   queryWindowsStatement,
   windowsLifelinePidsPsCommand,
 } from '../win-daemon.js';
 
 const ANCESTOR_WALK_LIMIT = 64;
 
-/** A Windows command line quotes paths. Drop one leading and one trailing `"`. */
-function unquoteToken(token: string): string {
-  let start = 0;
-  let end = token.length;
-  if (start < end && token[start] === '"')
-    start++;
-  if (end > start && token[end - 1] === '"')
-    end--;
-  return token.slice(start, end);
-}
+/** The first argv token of every real agent process: `node` on Unix, `node.exe` on Windows. */
+const NODE_BASENAMES = new Set(['node', 'node.exe']);
 
+/**
+ * Split a command line into argv tokens, **quote-aware**: a Windows install path contains spaces
+ * (`"C:\Program Files\nodejs\node.exe" …`), and splitting on whitespace alone turns it into
+ * `C:\Program` + `Files\nodejs\node.exe"`, which loses the executable. NUL separates too (the old
+ * `[\0\s]+` split did that deliberately).
+ */
 function commandLineTokens(commandLine: string | null): string[] {
   if (commandLine == null)
     return [];
-  return commandLine.split(/[\0\s]+/).filter(Boolean).map(unquoteToken).filter(Boolean);
+  const tokens: string[] = [];
+  for (const match of commandLine.matchAll(/"([^"]*)"|([^\0\s]+)/g)) {
+    const token = match[1] ?? match[2];
+    if (token)
+      tokens.push(token);
+  }
+  return tokens;
 }
 
-/** Same token rule as `pidfileProbe`: the entry is `lifeline.mjs`, not a substring of another path. */
+/** Path separators are not normalized by the OS: compare on a `/`-normalized copy (Windows `C:\…`). */
+function normalizeToken(token: string): string {
+  return token.replace(/\\/g, '/');
+}
+
+/** Basename of an argv token, after separator normalization. */
+function tokenBasename(token: string): string {
+  const normalized = normalizeToken(token);
+  const slash = normalized.lastIndexOf('/');
+  return slash < 0 ? normalized : normalized.slice(slash + 1);
+}
+
+/**
+ * Same token rule as `pidfileProbe`: the entry is `lifeline.mjs`, not a substring of another path.
+ * **The service entry only** — `stopLifelinePid` signals whatever this matches, and the CLI's
+ * stop paths must never signal a repo agent.
+ */
 export function commandLineIsLifelineAgent(commandLine: string | null): boolean {
-  return commandLineTokens(commandLine).some(token =>
-    token === 'lifeline.mjs'
-    || token.endsWith('/lifeline.mjs')
-    || token.endsWith('\\lifeline.mjs'),
+  return commandLineTokens(commandLine).some((token) => {
+    const normalized = normalizeToken(token);
+    return normalized === 'lifeline.mjs' || normalized.endsWith('/lifeline.mjs');
+  });
+}
+
+/**
+ * A repo (`pnpm run agent` → `tsx packages/agent/src/index.ts`) or built
+ * (`pnpm run start:agent` → `node dist/packages/agent/src/index.js`) agent.
+ *
+ * These entries carry no `run`/`start` token, so they are their own rule. The first token must be
+ * a node executable: that costs nothing (every real agent is launched by node) and keeps a shell
+ * tool which merely mentions the path — `rg packages/agent/src/index.ts` — out.
+ *
+ * Kept separate from `commandLineIsLifelineAgent` on purpose (that one gates `stopLifelinePid`,
+ * which may signal a process). Exported for the diagnosis consumers landing in Task 5.
+ */
+export function commandLineIsAgentEntry(commandLine: string | null): boolean {
+  const tokens = commandLineTokens(commandLine);
+  const first = tokens[0];
+  if (first == null || !NODE_BASENAMES.has(tokenBasename(first).toLowerCase()))
+    return false;
+  return tokens.some(token =>
+    AGENT_SOURCE_ENTRY_TOKENS.some(entry => normalizeToken(token).endsWith(entry)),
   );
 }
 
 /**
  * Guard predicate. An agent has the lifeline entry token and a separate `run`
- * or `start` token. `daemon`, `update`, `status`, `setup`, and `uninstall`
- * are not agents. A substring such as `runtime` is not `run`.
+ * or `start` token, **or** it is the dev/built entry point. `daemon`, `update`, `status`,
+ * `setup`, and `uninstall` are not agents. A substring such as `runtime` is not `run`.
  */
 export function commandLineIsRunningAgent(commandLine: string | null): boolean {
-  if (!commandLineIsLifelineAgent(commandLine))
-    return false;
-  return commandLineTokens(commandLine).some(token => token === 'run' || token === 'start');
+  if (commandLineIsLifelineAgent(commandLine))
+    return commandLineTokens(commandLine).some(token => token === 'run' || token === 'start');
+  return commandLineIsAgentEntry(commandLine);
 }
 
 export interface ProcessCommandRow {
@@ -122,19 +163,35 @@ export function ancestorPidsFromRows(
  * Callers pass this process and its ancestors so a parent `start` that
  * spawned ensure is not a second agent. A `start` or `run` outside that
  * set still counts.
+ *
+ * A repo dev run is **two** processes — the tsx wrapper and the real child — and both match the
+ * same entry. Report the agent instance, not the processes: when a matched pid's parent is also
+ * matched, only the child counts. Windows listings carry the parent column; Unix asks `ps` for
+ * the few matches. A parent that cannot be determined keeps the pid, so a failed lookup never
+ * drops a real agent.
  */
 export function runningAgentPids(
   rows: readonly ProcessCommandRow[],
   excludePids: ReadonlySet<number>,
+  parentOf: (pid: number) => number | null = parentPidOf,
 ): number[] {
-  const pids: number[] = [];
+  const matched: number[] = [];
   for (const row of rows) {
     if (!Number.isInteger(row.pid) || row.pid <= 1 || excludePids.has(row.pid))
       continue;
     if (commandLineIsRunningAgent(row.commandLine))
-      pids.push(row.pid);
+      matched.push(row.pid);
   }
-  return pids;
+  if (matched.length <= 1)
+    return matched;
+  const parents = new Set<number>();
+  for (const pid of matched) {
+    const row = rows.find(candidate => candidate.pid === pid);
+    const parent = row?.ppid ?? parentOf(pid);
+    if (parent != null)
+      parents.add(parent);
+  }
+  return matched.filter(pid => !parents.has(pid));
 }
 
 export function processCommandLine(pid: number): string | null {
@@ -154,13 +211,22 @@ export function processCommandLine(pid: number): string | null {
   }
 }
 
-function pidAlive(pid: number): boolean {
+/**
+ * `process.kill(pid, 0)` is the portable liveness probe. Windows denies `OpenProcess` for a
+ * process we may not signal (`EPERM`) — that is **not** "gone". Only "no such process" is dead:
+ * for a lock, a wrong "dead" verdict would hand the machine to a second agent.
+ */
+export function aliveFromKillError(code: string | undefined): boolean {
+  return code === 'EPERM';
+}
+
+export function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   }
-  catch {
-    return false;
+  catch (err) {
+    return aliveFromKillError((err as NodeJS.ErrnoException | undefined)?.code);
   }
 }
 
@@ -235,16 +301,37 @@ function windowsAgentPids(stdout: string): number[] {
   return runningAgentPids(rows, ancestorPidsFromRows(rows, process.pid, process.ppid));
 }
 
-/** Pids of lifeline `run` / `start` processes, excluding this process and its ancestors. */
-export function lifelineAgentPids(): number[] {
+/**
+ * Tri-state process scan. `unknown` means the listing itself failed and must never be read as
+ * "nothing is running": the lock treats a damaged lock file plus an unknown scan as held.
+ */
+export function scanAgentPids(): { kind: 'ok'; pids: number[] } | { kind: 'unknown' } {
   try {
-    if (process.platform === 'win32')
-      return windowsAgentPids(queryWindowsStatement(windowsLifelinePidsPsCommand(process.pid)));
-    return runningAgentPids(parsePsProcessRows(listUnixProcessTable()), selfAndAncestorPids());
+    if (process.platform === 'win32') {
+      return {
+        kind: 'ok',
+        pids: windowsAgentPids(queryWindowsStatement(windowsLifelinePidsPsCommand(process.pid))),
+      };
+    }
+    return {
+      kind: 'ok',
+      pids: runningAgentPids(parsePsProcessRows(listUnixProcessTable()), selfAndAncestorPids()),
+    };
   }
   catch {
-    return [];
+    return { kind: 'unknown' };
   }
+}
+
+/**
+ * Pids of lifeline agents, excluding this process and its ancestors. A failed scan is `[]`.
+ *
+ * Asymmetry worth knowing: the machine lock reads `unknown` as "possibly held" (refuse), while
+ * this wrapper collapses it to "none" for the CLI callers that predate the tri-state.
+ */
+export function lifelineAgentPids(): number[] {
+  const scan = scanAgentPids();
+  return scan.kind === 'ok' ? scan.pids : [];
 }
 
 /**

@@ -78,16 +78,45 @@ describe('install.ps1', () => {
     assert.match(src, /left untouched/);
   });
 
-  it('extracts with tar.exe and falls back to Expand-Archive -LiteralPath', () => {
+  // PATH is not a safe way to find it: Git-for-Windows / MSYS ships GNU tar, which reads
+  // `C:\...zip` as a remote host ("Cannot connect to C: resolve failed") and cannot open zip
+  // at all. Measured 2026-10-12: `lifeline update` started from Git Bash failed to extract the
+  // runtime zip, rolled back, and stayed on the old version. Only Windows' own tar may be used,
+  // and only by absolute path.
+  it('uses the bundled tar.exe by absolute path, never a tar from PATH', () => {
     const src = text();
-    assert.match(src, /tar\.exe/, 'Win10 1803+ 自带 tar.exe，优先用它');
-    assert.match(src, /Get-Command\s+tar\.exe/);
+    assert.doesNotMatch(src, /Get-Command\s+tar/, '解压不能用 PATH 解析（Get-Command tar）');
+    // Text presence is not the behaviour. Pin the **call** and the **branch**: reviewing this
+    // test (2026-10-12) showed that assertions on the strings above alone stayed green under two
+    // mutations — `& tar.exe -xf` (the PATH regression itself) and `if ($false)` (tar never runs,
+    // every machine silently downgraded to Expand-Archive).
+    assert.match(src, /&\s+\$tarExe\s+-xf/, '必须用解析出来的绝对路径调用');
+    assert.doesNotMatch(src, /(^|\s)&\s*tar(\.exe)?\s/m, '不许再按名字调用 tar');
+    assert.match(src, /\$env:SystemRoot/, 'Windows 自带的 tar.exe 要用 %SystemRoot% 定位');
+    assert.match(src, /System32\\tar\.exe/, '必须是 System32 下的那一个');
     // Win10 before 1803 has no tar.exe — a fallback is required, and it **must use -LiteralPath**
-    assert.match(src, /Expand-Archive\s+-LiteralPath/);
+    assert.match(
+      src,
+      /if\s*\(\s*\$tarExe\s*\)\s*\{[\s\S]{0,400}?&\s+\$tarExe\s+-xf[\s\S]{0,400}?\}\s*else\s*\{[\s\S]{0,400}?Expand-Archive\s+-LiteralPath[^\n]*-DestinationPath/,
+      'tar 分支由 $tarExe 决定，回落仍是 Expand-Archive -LiteralPath',
+    );
     assert.doesNotMatch(src, /Expand-Archive\s+-Path/, '-Path 会把 [] 当通配符');
     assert.match(src, /node\.exe/);
     assert.match(src, /lifeline\.mjs/);
     assert.match(src, /runtime\.next/);
+  });
+
+  // A native command's failure only sets $LASTEXITCODE -- it does not throw, not even under
+  // $ErrorActionPreference 'Stop' (measured 2026-10-12). Without this check a half-written
+  // runtime.next rides on the two sentinel files below and can be swapped in. install.sh guards
+  // its tar call the same way (`if ! tar -xJf …; then`).
+  it('refuses the install when tar exits non-zero', () => {
+    const src = text();
+    assert.match(
+      src,
+      /&\s+\$tarExe\s+-xf[^\n]*\n\s*if\s*\(\s*\$LASTEXITCODE\s+-ne\s+0\s*\)\s*\{[\s\S]{0,120}?Fail\s+'Extraction failed/,
+      'tar 的退出码必须检查，否则半解压的 runtime 可能被换上',
+    );
   });
 
   // A running node.exe cannot be deleted on Windows (Access denied) — must rename around it

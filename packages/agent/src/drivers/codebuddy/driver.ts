@@ -151,12 +151,18 @@ export const codebuddyDriver: IdeDriver = {
     const appNames = resolved
       ? [resolved, ...CODEBUDDY_APP_CANDIDATES.filter(name => name !== resolved)]
       : [...CODEBUDDY_APP_CANDIDATES];
+    // relauncher 与 quietWake 必须共享同一份 deps——唤醒判据偏离自愈判据就会
+    // 出现"醒了却不动手 / 动了却没醒"的分叉。
+    const deps = defaultCodeBuddyCdpRelaunchDeps();
     return {
       titleSuffixes: [...CODEBUDDY_TITLE_SUFFIXES],
       appNames,
-      relauncher: createCodeBuddyCdpRelauncher({
-        deps: defaultCodeBuddyCdpRelaunchDeps(),
-      }),
+      relauncher: createCodeBuddyCdpRelauncher({ deps }),
+      // 与 relauncher 共享同一份 deps（同一判据）；win32 的 tasklist 同步派生，tick 放宽
+      quietWake: {
+        isRunning: deps.isCodeBuddyRunning,
+        pollMs: process.platform === 'win32' ? 5_000 : undefined,
+      },
     };
   },
 

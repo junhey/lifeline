@@ -39,14 +39,30 @@ describe('cdpIssueCopy', () => {
     assert.equal(warming.text, relaunched.text);
   });
 
-  it('falls back to a generic no-listener sentence for cooldown, quit-pending, and platform skip', () => {
-    for (const relaunch of ['skipped-cooldown', 'skipped-quit-pending', 'skipped-platform'] as const) {
-      const copy = cdpIssueCopy(issue({ kind: 'no-listener', relaunch }), 'Cursor');
-      assert.equal(copy.tone, 'info');
-      assert.equal(copy.text, '连不上 Cursor 的调试端口');
-    }
+  it('falls back to a generic no-listener sentence for platform skip and a bare no-listener', () => {
+    const platform = cdpIssueCopy(issue({ kind: 'no-listener', relaunch: 'skipped-platform' }), 'Cursor');
+    assert.equal(platform.tone, 'info');
+    assert.equal(platform.text, '连不上 Cursor 的调试端口');
     const bare = cdpIssueCopy(issue({ kind: 'no-listener' }), 'CodeBuddy');
     assert.equal(bare.text, '连不上 CodeBuddy 的调试端口');
+  });
+
+  it('says quit is pending when the IDE will not quit', () => {
+    const copy = cdpIssueCopy(issue({ kind: 'no-listener', relaunch: 'skipped-quit-pending' }), 'Cursor');
+    assert.equal(copy.tone, 'progress');
+    assert.match(copy.text, /还没退出/);
+  });
+
+  it('says cooldown instead of a bare cannot-connect', () => {
+    const copy = cdpIssueCopy(issue({ kind: 'no-listener', relaunch: 'skipped-cooldown' }), 'Cursor');
+    assert.equal(copy.tone, 'progress');
+    assert.match(copy.text, /刚被重启过/);
+  });
+
+  it('warns when the burst fuse pauses self-healing', () => {
+    const copy = cdpIssueCopy(issue({ kind: 'no-listener', relaunch: 'skipped-throttled' }), 'Cursor');
+    assert.equal(copy.tone, 'warn');
+    assert.match(copy.text, /重启次数过多/);
   });
 
   it('keeps http occupancy copy distinct from a foreign CDP', () => {

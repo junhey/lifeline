@@ -443,6 +443,23 @@ export interface MachineInfo {
    * flows that don't yet know which machine. Default (old agent omits it) = the page falls back to the OS toggle.
    */
   platform?: AgentPlatform;
+  /**
+   * The **displaced** process, when this slot was taken over: the code whose reports are now being
+   * dropped. It answers "who is not reporting this machine" without ssh-ing anywhere.
+   * Cleared by that socket's own disconnect, by `forget()`, by the next takeover, or by a promotion
+   * that hands the row to **the socket this record names** (that process is reporting then). A
+   * promotion of a *different* candidate keeps it: the recorded process is still being dropped.
+   * Never persisted.
+   */
+  duplicateAgent?: DuplicateAgent;
+}
+
+export interface DuplicateAgent {
+  at: number;
+  /** Version the displaced process reported (`undefined` = an agent too old to report one). */
+  version?: string;
+  socketId: string;
+  instanceId?: string;
 }
 
 export interface MachinesListPayload {

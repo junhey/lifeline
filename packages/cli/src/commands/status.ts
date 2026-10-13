@@ -1,9 +1,12 @@
 import { codeBuddyActivePortCandidates, cursorActivePortCandidates } from '../../../agent/src/cdp/endpoint.js';
 import { describePortOccupant, probeCdpEndpoint } from '../../../agent/src/cdp/probe.js';
 import { canControlIde } from '../../../agent/src/live-ides.js';
+import { agentLockPath, readAgentLock } from '../../../agent/src/single-instance.js';
 import { BUILD_VERSION as VERSION } from '../build-version.js';
 import { formatCdpStatusLine, formatContentSourceLine, probeStatusCdp } from '../cdp-status.js';
 import { cliConfigPath } from '../config.js';
+import { pidAlive, processCommandLine, scanAgentPids } from '../daemon/agent-processes.js';
+import { agentStatusLines } from '../daemon/agent-status-lines.js';
 import { log, requireConfig } from '../ui.js';
 import { fetchLatestVersion, updateHint } from '../version.js';
 import { daemonProbe, logDaemonStatus } from './daemon.js';
@@ -44,7 +47,29 @@ export async function cmdStatus(): Promise<void> {
   await logCdpStatus('cursor', config.cdpUrl);
   await logCdpStatus('codebuddy', codebuddyCdpUrl);
 
-  logDaemonStatus(daemonProbe());
+  const daemon = daemonProbe();
+  logDaemonStatus(daemon);
+
+  // Who owns this machine locally. Reads the lock file and the process list only: this diagnosis has
+  // to work when the server — or the network — is the thing that is broken, so no request is added.
+  // The pid probes are lazy: `processCommandLine` spawns `ps` (or a CIM query on Windows), so it runs
+  // only for a lock that is present and whose pid is alive.
+  const lockPath = agentLockPath();
+  const lock = readAgentLock(lockPath);
+  const holderPid = lock.kind === 'ok' ? lock.lock.pid : null;
+  const holderAlive = holderPid != null && pidAlive(holderPid);
+  for (const line of agentStatusLines({
+    lock,
+    probe: {
+      alive: holderAlive,
+      commandLine: holderAlive && holderPid != null ? processCommandLine(holderPid) : null,
+    },
+    instances: scanAgentPids(),
+    daemonRunning: daemon.running,
+    lockPath,
+  })) {
+    log(line);
+  }
 
   try {
     const res = await fetch(`${config.serverUrl}/healthz`, { signal: AbortSignal.timeout(5000) });

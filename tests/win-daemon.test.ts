@@ -92,6 +92,12 @@ describe('windowsDaemonScript', () => {
     assert.match(src, /Elapsed\.TotalSeconds -lt 5/, '只记"秒退"（启动层失败），正常退出不记');
     assert.match(src, /cmd\.exe \/c "echo \[%DATE% %TIME%\]/, '由 cmd 写（5.1 的 >> 是 UTF-16LE）');
     assert.match(src, /1>> `"\$sup`"/, '诊断只能进 supervisor.log，不能指向被占的 out/err');
+    // The line must not diagnose **one** cause. With the machine lock held by a repo agent the
+    // launch exits 1 just as fast, and agent.err.log DOES carry the 4-line refusal — so the reader
+    // has to be pointed at that file first; "the logs are held" is only true when it is empty
+    // (measured 2026-10-12: the old wording sent the reader after the logs and never at the lock).
+    assert.match(src, /-- see agent\.err\.log for the reason/, '先指向权威日志');
+    assert.match(src, /if it is empty, another lifeline agent holds the logs/, '日志冲突只在 err 为空时成立');
   });
 });
 

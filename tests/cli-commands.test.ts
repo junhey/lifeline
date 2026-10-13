@@ -162,7 +162,15 @@ describe('CLI command surface', () => {
     assert.ok(codebuddyAt > cursorAt, 'codebuddy CDP after cursor');
     assert.ok(probeAt > codebuddyAt, 'daemon row after cursor and codebuddy CDP');
     assert.ok(remoteAt > probeAt, 'daemon row before remote health');
-    assert.match(body, /logDaemonStatus\(daemonProbe\(\)\)/);
+    // The probe result is reused for the agent rows below, so the probe and the print are two
+    // statements now: what matters is that the row is still built from `daemonProbe()`.
+    assert.match(body, /const daemon = daemonProbe\(\)/);
+    assert.match(body, /logDaemonStatus\(daemon\)/);
+    // …and the agent rows belong between the daemon row and the remote check, so a reader who is
+    // debugging a duplicate agent gets them before anything that needs the network.
+    const agentAt = body.indexOf('agentStatusLines({');
+    assert.ok(agentAt > probeAt, 'agent rows after the daemon row');
+    assert.ok(agentAt < remoteAt, 'agent rows before the remote health check');
     const helper = functionBody(cli, 'logDaemonStatus');
     assert.match(helper, /daemon {3}\$\{label\}/);
     assert.match(helper, /not installed/);

@@ -1,5 +1,6 @@
 import type { Socket } from 'socket.io-client';
 import type { IdeKind } from '../../protocol/src/index.js';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { hostname } from 'node:os';
 import { io } from 'socket.io-client';
@@ -41,6 +42,12 @@ export class Uplink extends EventEmitter {
   private liveIdes: IdeKind[] | undefined;
   /** Whether this machine is content-source only (Linux). Older servers ignore it. */
   private contentSource: boolean | undefined;
+  /**
+   * Process identity sent with every `agent:register`: minted once per process, so the server can
+   * tell this process reconnecting (a watchdog rebuild, a laptop wake) from a different process
+   * taking the machine's slot. Older servers ignore it.
+   */
+  private readonly instanceId = randomUUID();
   private watchdog: UplinkWatchdog;
 
   constructor(
@@ -100,6 +107,9 @@ export class Uplink extends EventEmitter {
         hostname: hostname(),
         // Server stores this so the web can show "which version this box is"; older servers ignore it.
         version: BUILD_VERSION,
+        // Stable across this process's rebuilds: a reconnect must not look like a takeover, and an
+        // old-code newcomer must not displace a process that can name itself (register-outcome.ts).
+        instanceId: this.instanceId,
         ...(this.liveIdes !== undefined ? { liveIdes: this.liveIdes } : {}),
         ...(platform !== undefined ? { platform } : {}),
         // This machine is content-source only (Linux). The server uses this to
@@ -152,6 +162,14 @@ export class Uplink extends EventEmitter {
 
     socket.on('agent:rejected', () => {
       this.emit('rejected');
+    });
+
+    // The server gave this machine's slot to another process. Forwarded as its own event, not through
+    // `onAny` (which carries only `command:*` / `session:get`): the decision — stand down, or keep the
+    // lock and wait for the next registration to take the slot back — belongs to `index.ts`, which
+    // owns the lock (see superseded-outcome.ts).
+    socket.on('agent:superseded', (payload?: unknown) => {
+      this.emit('superseded', payload);
     });
   }
 

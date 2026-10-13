@@ -85,13 +85,20 @@ export function windowsDaemonScript(nodePath: string, mjsPath: string): string {
     '  $env:LIFELINE_SUPERVISED = \'1\'',
     '  & cmd.exe /c "`"$node`" `"$mjs`" run 1>> `"$out`" 2>> `"$err`""',
     '  $sw.Stop()',
-    '  # A launch that dies in milliseconds never ran the agent: cmd could not even open the',
-    '  # redirect targets (measured, 2026-09-20: "The process cannot access the file because it',
-    '  # is being used by another process" -- a leftover lifeline agent still holds the logs).',
-    '  # That message bubbles up to this script, whose stdout/stderr the Task Scheduler',
-    '  # discards. Record it in a file the other agent has no handle on.',
+    '  # A launch that dies in milliseconds never ran the agent, and it has **two** causes: cmd could',
+    '  # not even open the redirect targets (measured 2026-09-20: "The process cannot access the file',
+    '  # because it is being used by another process" -- a leftover lifeline agent still holds the',
+    '  # logs), or the machine lock is held (measured 2026-10-12: a repo agent; agent.err.log then',
+    '  # carries the refusal, so that file is what a reader must be sent to first). The message',
+    '  # bubbles up to this script, whose stdout/stderr the Task Scheduler discards. Record it in a',
+    '  # file the other agent has no handle on.',
     '  if ($LASTEXITCODE -ne 0 -and $sw.Elapsed.TotalSeconds -lt 5) {',
-    '    & cmd.exe /c "echo [%DATE% %TIME%] launch failed, exit $LASTEXITCODE -- another lifeline agent may still hold the logs; run: lifeline stop 1>> `"$sup`""',
+    // The text must name **both** causes an instant exit has: the machine lock (a repo/foreground
+    // agent -- agent.err.log then carries the 4-line refusal) or the log files being held (err says
+    // nothing, because it could not be opened). Point at the log first; the "logs held" reading is
+    // only valid when it is empty. Measured 2026-10-12: the old wording blamed the logs while the
+    // lock was held, which is what the reader is least likely to guess.
+    '    & cmd.exe /c "echo [%DATE% %TIME%] launch failed, exit $LASTEXITCODE -- see agent.err.log for the reason; if it is empty, another lifeline agent holds the logs -- run: lifeline stop 1>> `"$sup`""',
     '  }',
     '  if ($sw.Elapsed.TotalSeconds -ge 60) {',
     '    $backoff = 5',
@@ -240,6 +247,25 @@ export function windowsUnregisterPsCommand(
  */
 export const AGENT_ENTRY_BASENAME = 'lifeline.mjs';
 
+/**
+ * Repo / built agent entry points (`pnpm run agent`, `pnpm run start:agent`). They sit next to the
+ * runtime filename because the JS predicate and the generated PowerShell have to agree — those two
+ * criteria drifting is exactly why the filename became a constant.
+ */
+export const AGENT_SOURCE_ENTRY_TOKENS = [
+  'packages/agent/src/index.ts',
+  'dist/packages/agent/src/index.js',
+] as const;
+
+/** `-like` is case-insensitive and treats only `*?[]` as wildcards; these needles contain none. */
+export function psCommandLineMatchesAgent(): string {
+  const needles = [
+    AGENT_ENTRY_BASENAME,
+    ...AGENT_SOURCE_ENTRY_TOKENS.flatMap(token => [token, token.replace(/\//g, '\\')]),
+  ];
+  return needles.map(needle => `$_.CommandLine -like '*${needle}*'`).join(' -or ');
+}
+
 export function windowsStatusPsCommand(taskName: string = WINDOWS_DAEMON_TASK): string {
   return [
     `$t = Get-ScheduledTask -TaskName '${esc(taskName)}' -ErrorAction SilentlyContinue`,
@@ -262,7 +288,7 @@ export function windowsStatusPsCommand(taskName: string = WINDOWS_DAEMON_TASK): 
 export function windowsLifelinePidsPsCommand(excludePid?: number): string {
   const notSelf = excludePid ? ` -and $_.ProcessId -ne ${excludePid}` : '';
   return [
-    `$p = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine -like '*${AGENT_ENTRY_BASENAME}*'${notSelf} })`,
+    `$p = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and (${psCommandLineMatchesAgent()})${notSelf} })`,
     // pid, parent pid, command line. The ancestor walk uses the parent column in JS.
     `$p | ForEach-Object { 'proc=' + $_.ProcessId + [char]9 + $_.ParentProcessId + [char]9 + $_.CommandLine.Replace([char]13, ' ').Replace([char]10, ' ') }`,
   ].join('; ');

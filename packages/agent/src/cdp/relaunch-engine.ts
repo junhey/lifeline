@@ -55,6 +55,14 @@ export interface IdeCdpRelaunchDeps {
 
 export const CDP_RELAUNCH_COOLDOWN_MS = 60_000;
 export const CDP_RELAUNCH_GRACE_MS = 1_500;
+/**
+ * Retry gate for a quit that did not finish (save dialog / already exiting).
+ * **Must stay well under the cooldown**: a failed quit took no action, so the
+ * 60s cooldown (which protects real quit+reopen cycles) no longer applies —
+ * this gate is the only pacing. 15s ≈ one quit attempt's own cost (osascript
+ * 10s timeout + quit poll), so attempts do not queue behind each other.
+ */
+export const QUIT_PENDING_RETRY_MS = 15_000;
 const DEFAULT_COOLDOWN_MS = CDP_RELAUNCH_COOLDOWN_MS;
 const DEFAULT_GRACE_MS = CDP_RELAUNCH_GRACE_MS;
 const UNREACHABLE_POLL_MS = 500;
@@ -146,6 +154,15 @@ export function createIdeCdpRelauncher(opts: {
   let noExeLogged = false;
   /** Same de-dupe rationale as `noExeLogged`: hit once per 30s reconnect, so log once per episode. */
   let updaterLogged = false;
+  /**
+   * Last failed-quit timestamp (`QUIT_PENDING_RETRY_MS` gate) + its episode
+   * log flag. A gated retry must not re-log — it is "still the same stuck
+   * quit", not a new failure.
+   */
+  let lastQuitPendingAt = 0;
+  let quitPendingLogged = false;
+  /** Burst-fuse log, once per episode (same rationale as `quitPendingLogged`). */
+  let throttleLogged = false;
 
   return {
     async maybeRelaunch(port: number): Promise<RelaunchResult> {
@@ -182,11 +199,14 @@ export function createIdeCdpRelauncher(opts: {
       // Rate fuse: cooldown only guarantees "not consecutive"; it does not stop "once every 60s, forever" (review R3 reproduced 3 times).
       attempts = attempts.filter(t => now - t < burstWindowMs);
       if (attempts.length >= burstMax) {
-        deps.log(
-          `${productName} has been relaunched ${attempts.length} time(s) in the last `
-          + `${Math.round(burstWindowMs / 60_000)}min; NOT killing it again. `
-          + 'Check the CDP endpoint / DevToolsActivePort before the next attempt.',
-        );
+        if (!throttleLogged) {
+          throttleLogged = true;
+          deps.log(
+            `${productName} has been relaunched ${attempts.length} time(s) in the last `
+            + `${Math.round(burstWindowMs / 60_000)}min; NOT killing it again. `
+            + 'Check the CDP endpoint / DevToolsActivePort before the next attempt.',
+          );
+        }
         return 'skipped-throttled';
       }
       // "Quit first, then launch" has a trap: **if we cannot launch, we have
@@ -210,16 +230,43 @@ export function createIdeCdpRelauncher(opts: {
         }
         return 'skipped-no-exe';
       }
-      // Cooldown uses lastAttempt, **not recorded as an attempt**: the user just opened a save dialog, not a mistaken relaunch.
-      lastAttempt = now;
-      deps.log(
-        `${productName} is running without CDP; quitting and relaunching with --remote-debugging-port=${port}`,
-      );
+      // A previous quit did not finish: pace with the short gate, not the 60s
+      // cooldown — no action was taken, so the cooldown does not apply.
+      // Silent on purpose: the attempt that failed already logged this episode.
+      if (lastQuitPendingAt > 0 && now - lastQuitPendingAt < QUIT_PENDING_RETRY_MS)
+        return 'skipped-quit-pending';
+      // Same episode rule as `noExeLogged`: a stuck quit can persist for hours
+      // (save dialog); the intent line must not repeat every retry.
+      if (!quitPendingLogged) {
+        deps.log(
+          `${productName} is running without CDP; quitting and relaunching with --remote-debugging-port=${port}`,
+        );
+      }
       const quit = await deps.quit();
       if (!quit) {
-        deps.log(`${productName} did not quit (save dialog or already exiting); will retry later`);
+        // Anchor at the **return** time: a failed quit itself takes 25–35s
+        // (osascript + quit poll), so an anchor taken before it would already
+        // be past the gate when we get here → every reconnect quits again.
+        lastQuitPendingAt = deps.now();
+        if (!quitPendingLogged) {
+          quitPendingLogged = true;
+          deps.log(
+            `${productName} did not quit (save dialog or already exiting); will retry in `
+            + `${Math.round(QUIT_PENDING_RETRY_MS / 1000)}s`,
+          );
+        }
         return 'skipped-quit-pending';
       }
+      // Cooldown protects **real actions**: record only after the quit
+      // succeeded — recording before it made a "did not quit" wait out the
+      // full 60s for nothing (the quit-pending gate does the pacing now).
+      // Must still be recorded **before** openWithCdp: if the open fails we
+      // have just closed the user's IDE, and a fast-poll retry loop there is
+      // the worse evil.
+      lastAttempt = now;
+      lastQuitPendingAt = 0;
+      quitPendingLogged = false;
+      throttleLogged = false;
       // Only count it once we actually quit and relaunched.
       attempts.push(now);
       seenRunningAt = 0;
@@ -241,6 +288,9 @@ export function createIdeCdpRelauncher(opts: {
       attempts = [];
       noExeLogged = false;
       updaterLogged = false;
+      lastQuitPendingAt = 0;
+      quitPendingLogged = false;
+      throttleLogged = false;
     },
   };
 }

@@ -195,9 +195,26 @@ function Install-Lifeline {
   }
   [System.IO.Directory]::CreateDirectory($nextDir) | Out-Null
 
-  $tarCmd = Get-Command tar.exe -ErrorAction SilentlyContinue
-  if ($tarCmd) {
-    & $tarCmd.Source -xf $zipPath -C $nextDir
+  # Resolve Windows' own tar.exe by **absolute path**, never through PATH: a Git-for-Windows /
+  # MSYS install ships GNU tar, which reads `C:\...zip` as a remote host ("Cannot connect to C:
+  # resolve failed") and cannot open zip at all -- and it shadows System32 whenever the installer
+  # is started from such a shell (measured 2026-10-12: `lifeline update` from Git Bash failed to
+  # extract the runtime zip and rolled back). SysWOW64 redirection covers a 32-bit PowerShell.
+  $tarExe = $null
+  if ($env:SystemRoot) {
+    $systemTar = Join-Path $env:SystemRoot 'System32\tar.exe'
+    if (Test-Path -LiteralPath $systemTar) {
+      $tarExe = $systemTar
+    }
+  }
+  if ($tarExe) {
+    # A native command's failure only sets $LASTEXITCODE -- it does not throw, not even under
+    # $ErrorActionPreference 'Stop' (measured 2026-10-12) -- so a half-written runtime.next would
+    # otherwise ride on the two sentinel files below. install.sh guards its tar call the same way.
+    & $tarExe -xf $zipPath -C $nextDir
+    if ($LASTEXITCODE -ne 0) {
+      Fail 'Extraction failed -- the existing install was left untouched'
+    }
   } else {
     # tar.exe only exists from Windows 10 1803 on. Use -LiteralPath rather than
     # its sibling wildcard form: brackets in LIFELINE_HOME would be treated as a

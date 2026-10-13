@@ -2,6 +2,7 @@ import type { Namespace, Socket, Server as SocketServer } from 'socket.io';
 import type {
   AgentPlatform,
   AgentRegisterPayload,
+  DuplicateAgent,
   PatchSeqBaseline,
   SessionBodyPayload,
   SessionGetPayload,
@@ -27,6 +28,7 @@ import {
 import { IdentityStore } from './identity-store.js';
 import { emptyCursorState } from './pages/empty-state.js';
 import { tailPage } from './pages/session-page.js';
+import { decideRegister } from './register-outcome.js';
 import { SessionStore } from './session-store.js';
 import { timingLastBubble, timingLog, timingPreview } from './timing-log.js';
 
@@ -75,6 +77,12 @@ export interface MachineInfo {
   platform?: AgentPlatform;
   /** Machine ownership (userId of whoever enrolled); normally always present — an agent whose ownership cannot be resolved cannot connect (see resolveOwner) */
   owner?: string;
+  /**
+   * The displaced process when this slot was taken over: the code whose reports are being dropped.
+   * In-memory only (a server restart clears it, like the rest of the live picture) — see
+   * `MachineInfo.duplicateAgent` in the protocol.
+   */
+  duplicateAgent?: DuplicateAgent;
 }
 
 export interface AgentSocket {
@@ -114,6 +122,25 @@ interface AgentConn {
    * as the criterion (review R1).
    */
   contentSource?: boolean;
+  /**
+   * Process identity from `agent:register` (`undefined` = an agent older than this field, which
+   * therefore cannot displace a connected process that names itself).
+   */
+  instanceId?: string;
+  /**
+   * The displaced process when this slot was taken over: the code whose reports are being dropped.
+   * In-memory only; cleared by its own socket's disconnect, `forget()`, the next takeover, or a
+   * promotion that hands the row to **that same recorded socket**.
+   */
+  duplicateAgent?: DuplicateAgent;
+  /**
+   * Non-active sockets that are still connected, kept so one can be promoted when the active socket
+   * goes away — an old process never re-registers on its own, so the machine would otherwise report
+   * offline while a live agent is attached. Two kinds land here: a newcomer whose registration was
+   * ignored (an old process trying to take a slot a current agent holds) and a displaced socket that
+   * is still connected.
+   */
+  ignoredSockets?: Set<AgentSocket>;
   /**
    * `state:patch` sequence tracking (in-memory only). Seeded by the baseline on `state:full`; `undefined`
    * = no baseline yet (old agent, or no full since this socket registered).
@@ -249,6 +276,7 @@ export class AgentDirectory extends EventEmitter {
           ...(conn.cliVersion ? { cliVersion: conn.cliVersion } : {}),
           ...(conn.platform ? { platform: conn.platform } : {}),
           ...(conn.owner ? { owner: conn.owner } : {}),
+          ...(conn.duplicateAgent ? { duplicateAgent: conn.duplicateAgent } : {}),
         };
       });
   }
@@ -370,11 +398,94 @@ export class AgentDirectory extends EventEmitter {
     if (!existing)
       existing = this.adoptStaleSibling(agentId, hostname, owner);
 
-    const replacing = !!(existing?.socket && existing.socket !== socket);
+    // Trimmed on both sides of the wire: the agent decides "can I name myself?" the same way
+    // (superseded-outcome.ts). A blank id read as an identity here would let the server hand the slot
+    // to a process the agent side then refuses to stand down for — the ping-pong this change removes.
+    const rawInstanceId = typeof info.instanceId === 'string' ? info.instanceId.trim() : '';
+    const incomingInstanceId = rawInstanceId === '' ? undefined : rawInstanceId;
+    // Resolved up front: the takeover event describes the winner, and it is emitted before `conn` is
+    // overwritten (design order: warn → tell the loser → record).
+    const incomingVersion = typeof info.version === 'string' && info.version ? info.version : undefined;
+    const outcome = decideRegister({
+      hasRecordedConnection: existing?.socket != null,
+      sameSocket: existing?.socket === socket,
+      recordedSocketConnected: existing?.socket?.connected === true,
+      incomingInstanceId,
+      recordedInstanceId: existing?.instanceId,
+    });
 
-    if (existing?.socket && existing.socket !== socket) {
+    // An old process (no `instanceId`) trying to take a slot a current agent still holds: leave the
+    // active socket alone — the incumbent never learns about it, so it cannot be made to exit — and
+    // remember the newcomer so it can be promoted if the incumbent goes away.
+    if (outcome === 'ignore-duplicate' && existing?.socket) {
+      const ignored = existing.ignoredSockets ?? new Set<AgentSocket>();
+      ignored.add(socket);
+      existing.ignoredSockets = ignored;
+      console.warn(
+        `[agent-hub] ignored duplicate registration agentId=${agentId} socket=${socket.id}`
+        + ` version=${info.version ?? 'unknown'} — ${existing.socket.id}`
+        + ` (v${existing.cliVersion ?? 'unknown'}, instance ${existing.instanceId ?? 'none'}) holds the slot`
+        + `; at=${new Date(this.now()).toISOString()}`,
+      );
+      return agentId;
+    }
+
+    const replacedSocket = existing?.socket && existing.socket !== socket ? existing.socket : null;
+    // The displaced process, captured **before** `conn` is overwritten below. A `reconnect` is the
+    // same process coming back: it replaces the socket but displaces nobody.
+    //
+    // `takeover-after-drop` is defensive: socket.io flips `connected` to false *before* emitting
+    // 'disconnect', and the disconnect handler nulls `conn.socket` — all in one synchronous tick, so
+    // this row is reached only through the "same socket re-registered under another agentId" path, in
+    // which that socket's disconnect has already run. The record it writes is then cleared by the next
+    // takeover or by `forget()`, not by a disconnect.
+    const displaced = (outcome === 'takeover' || outcome === 'takeover-after-drop') && replacedSocket
+      ? { socket: replacedSocket, version: existing!.cliVersion, instanceId: existing!.instanceId }
+      : null;
+
+    if (displaced && existing) {
+      const at = this.now();
+      console.warn(
+        `[agent-hub] agent takeover agentId=${agentId} host=${hostname}`
+        + ` socket ${displaced.socket.id} → ${socket.id};`
+        + ` version ${displaced.version ?? 'unknown'} → ${incomingVersion ?? 'unknown'};`
+        + ` instance ${displaced.instanceId ?? 'none'} → ${incomingInstanceId ?? 'none'};`
+        + ` at=${new Date(at).toISOString()}`,
+      );
+      // Order per spec: warn → tell the loser → record. Telling it is not disconnecting it: a
+      // server-side disconnect makes socket.io-client stop reconnecting while its watchdog rebuilds
+      // later, which would flap the slot (see design.md).
+      if (displaced.socket.connected) {
+        displaced.socket.emit('agent:superseded', {
+          reason: 'duplicate-agent',
+          by: {
+            version: incomingVersion,
+            socketId: socket.id,
+            hostname,
+            instanceId: incomingInstanceId,
+          },
+          at,
+        });
+        // An old-code loser stays connected and never re-registers on its own: keep it as a promotion
+        // candidate so the machine still reports if the winner goes away.
+        const ignored = existing.ignoredSockets ?? new Set<AgentSocket>();
+        ignored.add(displaced.socket);
+        existing.ignoredSockets = ignored;
+      }
+      // The record describes the **displaced** process: that is the code whose reports are now being
+      // dropped. Cleared by that socket's own disconnect, by forget(), by the next takeover, or by a
+      // promotion that hands the row to that same socket.
+      existing.duplicateAgent = {
+        at,
+        ...(displaced.version ? { version: displaced.version } : {}),
+        socketId: displaced.socket.id,
+        ...(displaced.instanceId ? { instanceId: displaced.instanceId } : {}),
+      };
+    }
+
+    if (replacedSocket) {
       this.failPending(agentId, 'Agent disconnected');
-      this.socketToAgent.delete(existing.socket.id);
+      this.socketToAgent.delete(replacedSocket.id);
     }
 
     const conn: AgentConn = existing ?? {
@@ -387,12 +498,16 @@ export class AgentDirectory extends EventEmitter {
     };
     conn.hostname = hostname;
     conn.socket = socket;
+    conn.instanceId = incomingInstanceId;
+    // This socket is the active one now, so it is never a promotion candidate itself; candidates from
+    // earlier registrations may still be connected and keep their place.
+    conn.ignoredSockets?.delete(socket);
     conn.lastSeenAt = this.now();
     // A new socket means a new agent process or connection: the old seq line means nothing; the next full re-seeds it.
     conn.patchTrack = undefined;
     // Old agent omits version: write "unknown" rather than keeping the previous value — on a downgrade
     // back to an old CLI the stale version number would become a false signal (the page would think it is running the new one).
-    conn.cliVersion = typeof info.version === 'string' && info.version ? info.version : undefined;
+    conn.cliVersion = incomingVersion;
     // Ownership follows the handshake token; reaching here means either the same person, or this machine has no owner yet.
     // A registration with different ownership was already rejected at the gate; re-sign also does not cross people (see the ownership gate above).
     conn.owner = owner;
@@ -409,7 +524,7 @@ export class AgentDirectory extends EventEmitter {
 
     // Socket takeover needs a sync; a **new ledger** (first enroll / deleted then returning) does too: the server
     // has no books for this machine, so the agent must re-report state and census in full, or the page sees an empty shell.
-    if (replacing || !existing) {
+    if (replacedSocket || !existing) {
       socket.emit('agent:sync');
     }
 
@@ -1105,6 +1220,17 @@ export class AgentDirectory extends EventEmitter {
   }
 
   onSocketDisconnect(socket: AgentSocket): void {
+    // A displaced socket has no `socketToAgent` entry (`register()` removed it at takeover), so the
+    // record must be cleared by socket id **before** the lookup below — otherwise the notice
+    // outlives the process it describes. The same scan drops it from any promotion set.
+    for (const conn of this.agents.values()) {
+      if (conn.duplicateAgent?.socketId === socket.id) {
+        conn.duplicateAgent = undefined;
+        this.emit('machines:changed');
+      }
+      conn.ignoredSockets?.delete(socket);
+    }
+
     const agentId = this.socketToAgent.get(socket.id);
     this.socketToAgent.delete(socket.id);
     if (!agentId)
@@ -1114,6 +1240,31 @@ export class AgentDirectory extends EventEmitter {
       return;
 
     conn.socket = null;
+    // Promotion: an ignored old process is still connected and never re-registers on its own, so
+    // without this the machine would report offline while a live agent is attached.
+    const promoted = [...(conn.ignoredSockets ?? [])].find(candidate => candidate.connected) ?? null;
+    if (promoted) {
+      conn.ignoredSockets?.delete(promoted);
+      conn.socket = promoted;
+      // The promoted process is an old one that cannot name itself: the recorded identity, version and
+      // patch epoch all describe the process that just left. Keeping any of them would put a stale
+      // version on a row that is fed by different code — the exact false signal this change removes.
+      conn.instanceId = undefined;
+      conn.cliVersion = undefined;
+      conn.patchTrack = undefined;
+      // …and if the record describes **this** socket, it must go: the promoted process is the one
+      // reporting now, so "已顶替 vX" would name the very code feeding the row. When it describes a
+      // *different* still-connected socket, that process is still being dropped — keep the notice,
+      // and its own disconnect (matched by socket id) will clear it.
+      if (conn.duplicateAgent?.socketId === promoted.id)
+        conn.duplicateAgent = undefined;
+      conn.lastSeenAt = this.now();
+      this.socketToAgent.set(promoted.id, agentId);
+      console.warn(
+        `[agent-hub] promoted ignored socket ${promoted.id} for ${agentId} (the active socket ${socket.id} went away)`,
+      );
+      promoted.emit('agent:sync');
+    }
     this.persistNow(conn);
     this.failPending(agentId, 'Agent disconnected');
     this.emit('machines:changed');
@@ -1384,9 +1535,13 @@ export class AgentHub extends EventEmitter {
           }, 200);
           return;
         }
-        console.log(
-          `[agent-hub] Agent registered: ${agentId} (${info?.hostname ?? agentId})`,
-        );
+        // Only the socket that actually holds the slot says "registered": an ignored duplicate is not a
+        // registration, and printing both lines would make one attempt read like two machines.
+        if (this.directory.isActiveSocket(socket)) {
+          console.log(
+            `[agent-hub] Agent registered: ${agentId} (${info?.hostname ?? agentId})`,
+          );
+        }
       });
 
       socket.on('state:full', (state: unknown) => {

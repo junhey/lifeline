@@ -19,6 +19,15 @@ export function cdpIssueCopy(issue: CdpIssue, ideLabel: string): { tone: CdpIssu
       if (issue.relaunch === 'relaunched' || issue.relaunch === 'skipped-warming-up') {
         return { tone: 'progress', text: `${ideLabel} 没有带调试参数启动，正在尝试自动重启它…` };
       }
+      if (issue.relaunch === 'skipped-quit-pending') {
+        return { tone: 'progress', text: `${ideLabel} 还没退出（可能有未保存的内容），稍后会自动重试` };
+      }
+      if (issue.relaunch === 'skipped-cooldown') {
+        return { tone: 'progress', text: `${ideLabel} 刚被重启过，冷却片刻后会自动重试` };
+      }
+      if (issue.relaunch === 'skipped-throttled') {
+        return { tone: 'warn', text: `${ideLabel} 短时间内重启次数过多，自动重启已暂停` };
+      }
       return { tone: 'info', text: `连不上 ${ideLabel} 的调试端口` };
     case 'not-cdp':
       if (issue.notCdpCause === 'foreign') {

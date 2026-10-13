@@ -128,4 +128,10 @@ export interface AgentRegisterPayload {
    * looking at the page may not be the same OS. Default (old agent) = the page falls back to its own OS toggle.
    */
   platform?: AgentPlatform;
+  /**
+   * Process identity: a uuid minted once per agent process, stable across uplink watchdog rebuilds.
+   * The server uses it to separate "the same process reconnected" from "a different process took
+   * the slot". Old agents omit it, and then may only take a slot that nobody current is holding.
+   */
+  instanceId?: string;
 }

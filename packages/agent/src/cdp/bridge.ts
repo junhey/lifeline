@@ -163,6 +163,27 @@ export interface CdpRelauncher {
   noteConnected?: () => void;
 }
 
+/**
+ * Quiet-wake: while the bridge sits in the quiet no-listener poll (IDE not
+ * running / no exe / update in progress / burst fuse), a **cheap process
+ * probe** — the same predicate the relauncher's `isRunning` uses — watches
+ * for the "IDE process just appeared" rising edge and probes CDP immediately.
+ *
+ * Why not poll CDP faster instead: every reconnect cycle logs one
+ * "Reconnecting in …" line, and a fast cadence while the IDE is closed is
+ * permanent per-minute log noise (the exact class `noExeLogged` exists to
+ * prevent). The 30s CDP poll stays as the backstop (its non-refused branches
+ * also run `lsof`); only the wake-up is process-only.
+ */
+export interface QuietWake {
+  /** Must be the same predicate the relauncher uses, or the wake diverges from the self-heal decision. */
+  isRunning: () => boolean;
+  /** Test hook: tick interval (ms). Default `QUIET_WAKE_POLL_MS`. */
+  pollMs?: number;
+}
+
+export const QUIET_WAKE_POLL_MS = 2_000;
+
 export interface CDPBridgeOptions {
   titleSuffixes?: string[];
   relauncher?: CdpRelauncher;
@@ -170,6 +191,8 @@ export interface CDPBridgeOptions {
   appNames?: string[];
   /** Which IDE this bridge attaches to. Default `'cursor'`. */
   ide?: IdeKind;
+  /** Quiet-wake process watcher (rising edge → immediate CDP probe). Absent = today's behavior. */
+  quietWake?: QuietWake;
   /** Test hook: skip HTTP `/json` discovery. */
   fetchTargets?: () => Promise<CdpPageTarget[]>;
   /** Test hook: skip HTTP/UA probe. */
@@ -344,6 +367,10 @@ export class CDPBridge extends EventEmitter {
   private connectInFlight: Promise<void> | null = null;
   private connectGeneration = 0;
   private currentIssue: CdpIssue | null = null;
+  private readonly quietWake?: QuietWake;
+  private quietWatchTimer: ReturnType<typeof setInterval> | null = null;
+  /** Baseline of the quiet watch (captured on arm): only false→true triggers a probe. */
+  private quietSeenRunning = false;
   private endpointSource: CdpEndpointSource | undefined;
   /** Instance uuid from `DevToolsActivePort`: the pre-connect probe must use it for kinship too (or the identity check dies at the attach layer). */
   private endpointUuid: string | undefined;
@@ -392,6 +419,7 @@ export class CDPBridge extends EventEmitter {
     this.probeOverride = options.probe;
     this.createClient = options.createClient ?? (() => new CdpClient());
     this.resolveUrl = options.resolveUrl;
+    this.quietWake = options.quietWake;
   }
 
   get cdpUrl(): string {
@@ -530,6 +558,26 @@ export class CDPBridge extends EventEmitter {
           // reason), but **do not 500ms fast-poll** — a reinstall / path change
           // is not something that happens in seconds.
           if (result === 'skipped-no-exe') {
+            this.setIssue(issue);
+            this.scheduleReconnect('no-listener', { quiet: true });
+            return;
+          }
+          // Burst fuse tripped: "leave the IDE alone" is the whole point, and
+          // the default branch's 500ms fast poll would storm the log for the
+          // rest of the 10-minute window. Keep the issue visible (it is a real
+          // fault) — only the cadence goes quiet.
+          if (result === 'skipped-throttled') {
+            this.setIssue(issue);
+            this.scheduleReconnect('no-listener', { quiet: true });
+            return;
+          }
+          // Quit stuck on a save dialog: same storm class, and unlike the fuse
+          // there is not even a 10-minute window bounding it — the dialog can
+          // sit for hours. The engine's retry gate is subsumed by one quit
+          // attempt's own 25–35s duration, so the quiet 30s cadence loses
+          // nothing; the wake watcher covers the "user finally dismissed it"
+          // transition.
+          if (result === 'skipped-quit-pending') {
             this.setIssue(issue);
             this.scheduleReconnect('no-listener', { quiet: true });
             return;
@@ -761,6 +809,43 @@ export class CDPBridge extends EventEmitter {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    // Any connect attempt (or disconnect) supersedes the quiet watcher; the
+    // next quiet schedule re-arms it. One funnel, no second lifecycle.
+    this.clearQuietWatch();
+  }
+
+  private clearQuietWatch(): void {
+    if (this.quietWatchTimer) {
+      clearInterval(this.quietWatchTimer);
+      this.quietWatchTimer = null;
+    }
+  }
+
+  /**
+   * Rising-edge process watch for the quiet phase. Baseline is captured on
+   * arm, so a process already up when we went quiet (no-exe /
+   * update-in-progress) has no edge; 消失→再现 (an updater relaunching the
+   * new version) still fires. Silent per tick: only the wake probe logs.
+   */
+  private armQuietWatch(): void {
+    const wake = this.quietWake;
+    if (!wake || this.quietWatchTimer)
+      return;
+    this.quietSeenRunning = wake.isRunning();
+    this.quietWatchTimer = setInterval(() => {
+      if (this.intentionalDisconnect || this.isConnected()) {
+        this.clearQuietWatch();
+        return;
+      }
+      const wasRunning = this.quietSeenRunning;
+      const running = wake.isRunning();
+      this.quietSeenRunning = running;
+      if (!wasRunning && running) {
+        this.clearQuietWatch();
+        void this.connect();
+      }
+    }, wake.pollMs ?? QUIET_WAKE_POLL_MS);
+    this.quietWatchTimer.unref?.();
   }
 
   private async fetchTargets(verbose = false): Promise<CDPTarget[]> {
@@ -863,6 +948,8 @@ export class CDPBridge extends EventEmitter {
       }
       await this.connect();
     }, delay);
+    if (opts.quiet)
+      this.armQuietWatch();
   }
 }
 

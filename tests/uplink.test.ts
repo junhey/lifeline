@@ -146,3 +146,33 @@ describe('Uplink watchdog rebuild', () => {
     assert.equal(sockets.length, 2);
   });
 });
+
+/**
+ * `agent:superseded` is a message to one displaced process (see superseded-outcome.ts): it must reach
+ * `index.ts` as its own event, and it must **not** travel the `onAny` path that carries commands —
+ * that path exists for command dispatch, and its listeners treat every event as a command.
+ */
+describe('Uplink agent:superseded', () => {
+  it('surfaces it as `superseded`, payload intact', () => {
+    const { uplink, sockets } = makeUplink();
+    sockets[0]!.fire('connect');
+    const seen: unknown[] = [];
+    uplink.on('superseded', (payload: unknown) => seen.push(payload));
+    const payload = { reason: 'duplicate-agent', by: { version: '0.1.84', socketId: 's2', instanceId: 'i2' }, at: 7 };
+    sockets[0]!.fire('agent:superseded', payload);
+    assert.deepEqual(seen, [payload]);
+  });
+
+  it('keeps it off the onAny forwarder, which carries only commands and session:get', () => {
+    const { uplink, sockets } = makeUplink();
+    sockets[0]!.fire('connect');
+    const raw: string[] = [];
+    const commands: string[] = [];
+    uplink.on('agent:superseded', () => raw.push('agent:superseded'));
+    uplink.on('command:ping', () => commands.push('command:ping'));
+    sockets[0]!.fire('agent:superseded', { by: { instanceId: 'i2' } });
+    sockets[0]!.fire('command:ping', { commandId: 'c1' });
+    assert.deepEqual(raw, [], 'the raw event name must not be re-emitted by onAny');
+    assert.deepEqual(commands, ['command:ping'], 'command dispatch is untouched');
+  });
+});

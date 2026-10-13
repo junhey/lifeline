@@ -1,6 +1,7 @@
 import type { IdeKind } from '../net/protocol';
 import { ArrowCircleUp, Cpu, Database, Plus, WarningCircle } from '@phosphor-icons/react';
 import { useState } from 'react';
+import { machineNotice } from '../lib/duplicate-agent';
 import { machineLabel } from '../lib/machine-name';
 import { isOutdated } from '../lib/version';
 import { IDE_KINDS, IDE_LABELS } from '../net/protocol';
@@ -31,6 +32,7 @@ export function MachineList({ onNavigate }: { onNavigate?: () => void }) {
     <div className="flex flex-col gap-0.5">
       {liveMachines.map((m) => {
         const selected = m.agentId === selectedAgentId;
+        const notice = machineNotice(m);
         return (
           <div key={m.agentId}>
             {/* Don't absolutely-position ⋯ over the row: a 44px hit area would cover the trailing "offline / updatable"
@@ -63,6 +65,24 @@ export function MachineList({ onNavigate }: { onNavigate?: () => void }) {
                   <span className="inline-flex shrink-0 items-center gap-0.5 text-[length:var(--text-chrome)] text-[var(--accent)]">
                     <ArrowCircleUp size={12} weight="fill" />
                     可更新
+                  </span>
+                )}
+                {/* A takeover means this row's state is not from the agent the reader started: say so at the
+                    "可更新" chip's level, and keep the tone neutral — it is not an error of the machine. */}
+                {notice.displaced && (
+                  <span
+                    className="shrink-0 text-[length:var(--text-chrome)] text-[var(--text-weak)]"
+                    title="记录里的那个进程已被顶替、不再上报；当前这一行由占用槽位的 agent 上报"
+                  >
+                    {notice.displaced}
+                  </span>
+                )}
+                {notice.devBuild && (
+                  <span
+                    className="shrink-0 text-[length:var(--text-chrome)] text-[var(--text-weak)]"
+                    title="这台机器上报的不是发布版本（例如 dev 构建）"
+                  >
+                    dev
                   </span>
                 )}
                 {!m.connected && <span className="text-[length:var(--text-chrome)] text-[var(--text-weak)]">离线</span>}
@@ -127,6 +147,7 @@ export function MachineList({ onNavigate }: { onNavigate?: () => void }) {
           </button>
           {showContentSources && contentSources.map((m) => {
             const selected = m.agentId === selectedAgentId;
+            const notice = machineNotice(m);
             // Content sources must also be selectable: the server delivers body and conversation index for "the currently selected machine",
             // so you could never see this machine's sessions. Also switch to an IDE it actually has content for,
             // otherwise the list filters by the current IDE → it looks like "this machine has no sessions".
@@ -151,6 +172,13 @@ export function MachineList({ onNavigate }: { onNavigate?: () => void }) {
                     {machineLabel(m)}
                   </span>
                   <span className="text-[length:var(--text-chrome)] text-[var(--text-weak)]">仅内容</span>
+                  {/* Same copy as a normal row: a content source can be displaced too. */}
+                  {notice.displaced && (
+                    <span className="shrink-0 text-[length:var(--text-chrome)] text-[var(--text-weak)]">{notice.displaced}</span>
+                  )}
+                  {notice.devBuild && (
+                    <span className="shrink-0 text-[length:var(--text-chrome)] text-[var(--text-weak)]">dev</span>
+                  )}
                 </button>
                 <MachineRowMenu machine={m} />
               </div>

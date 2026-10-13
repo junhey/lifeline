@@ -75,6 +75,10 @@ curl -fsSL http://<server>:8080/public/install.sh | sh
 lifeline setup --server-url http://<server>:8080
 ```
 
+One agent per machine, and never the same `agentId` on two machines (a copied config is enough to make
+them evict each other — the machine lock cannot see across hosts). Diagnosis and the refusal text:
+[`agent-lifecycle.md`](./agent-lifecycle.md).
+
 ## Known limits (criteria)
 
 - **No compose implementation on macOS/podman locally**: selfhost.sh compose path has been checked for file generation / idempotency / prompt wording against real Docker; a full `up -d` smoke on a Linux host is still outstanding.
