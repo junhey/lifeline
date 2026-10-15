@@ -35,6 +35,7 @@ index.ts（遍历 registeredDrivers() 组装）
 
 ## 踩坑（判据）
 
+- **`not-cdp`（Chrome 占了 9222）必须按 port 0 自愈**，与 `no-listener` 同族：不要停在「关掉它，或换一个端口」。只重启本 IDE，绝不要再去绑已被占用的配置端口（见 `bridge.ts`）。
 - **runtime 回调签名带 `ide` 参数位**：`ContentLiveRuntime` 的 onSessionFull/Append/Patch/Sync 是 `(sessionId, messages, ide, seq)`——runtime 自己传 `adapter.ide`，别用外层循环变量遮蔽（等价但少了参数位会 TS 报错）。
 - **`ContentSource.close()` 是可选方法**：调用要 `adapter.close?.()`。
 - **`CursorWindow['kind']` 可选**（`kind?`）：driver 接口的 windowKind 标注用 `WindowKind`，调用方自己 `?? 'project'` 兜底。

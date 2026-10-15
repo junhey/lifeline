@@ -78,8 +78,14 @@ describe('cdpIssueCopy', () => {
     }), 'Cursor');
     assert.equal(http.tone, 'warn');
     assert.equal(foreign.tone, 'warn');
-    assert.equal(http.text, '9222 被 Google Chrome (pid 65600) 占着，lifeline 连不上 Cursor。关掉它，或换一个端口');
-    assert.equal(foreign.text, '端口 9222 上是 Chrome/148.0.7778.280，不是 Cursor');
+    assert.equal(
+      http.text,
+      '9222 被 Google Chrome (pid 65600) 占着，lifeline 连不上 Cursor；会尝试用随机端口自动重启它',
+    );
+    assert.equal(
+      foreign.text,
+      '端口 9222 上是 Chrome/148.0.7778.280，不是 Cursor；lifeline 会尝试用随机端口重启 Cursor',
+    );
     assert.notEqual(http.text, foreign.text);
   });
 
@@ -89,6 +95,7 @@ describe('cdpIssueCopy', () => {
     assert.match(copy.text, /9222/);
     assert.match(copy.text, /占着/);
     assert.match(copy.text, /Cursor/);
+    assert.match(copy.text, /随机端口/);
     assert.doesNotMatch(copy.text, /undefined/);
   });
 
@@ -97,8 +104,18 @@ describe('cdpIssueCopy', () => {
     assert.equal(copy.tone, 'warn');
     assert.match(copy.text, /端口 9222/);
     assert.match(copy.text, /不是 Cursor/);
+    assert.match(copy.text, /随机端口/);
     assert.doesNotMatch(copy.text, /undefined/);
     assert.doesNotMatch(copy.text, /还没打开窗口/);
+  });
+
+  it('shows progress while self-healing a occupied port', () => {
+    const copy = cdpIssueCopy(
+      issue({ kind: 'not-cdp', notCdpCause: 'http', occupant: 'Google Chrome (pid 1)', relaunch: 'relaunched' }),
+      'Cursor',
+    );
+    assert.equal(copy.tone, 'progress');
+    assert.match(copy.text, /随机端口自动重启/);
   });
 
   it('waits for a window instead of alarming', () => {

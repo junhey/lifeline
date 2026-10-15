@@ -120,11 +120,11 @@ describe('targetBarStatusText', () => {
     });
     assert.equal(
       targetBarStatusText(occupied, false),
-      '9222 被 Google Chrome (pid 65600) 占着，lifeline 连不上 Cursor。关掉它，或换一个端口',
+      '9222 被 Google Chrome (pid 65600) 占着，lifeline 连不上 Cursor；会尝试用随机端口自动重启它',
     );
     assert.equal(
       targetBarStatusText(occupied, false, false, 'CodeBuddy'),
-      '9222 被 Google Chrome (pid 65600) 占着，lifeline 连不上 CodeBuddy。关掉它，或换一个端口',
+      '9222 被 Google Chrome (pid 65600) 占着，lifeline 连不上 CodeBuddy；会尝试用随机端口自动重启它',
     );
 
     const waiting = stateWith({

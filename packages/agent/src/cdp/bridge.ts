@@ -503,17 +503,31 @@ export class CDPBridge extends EventEmitter {
         return;
 
       if (probed.kind !== 'ok' || !probed.target?.webSocketDebuggerUrl) {
-        if (probed.kind === 'no-listener') {
+        // no-listener: nobody on the port. not-cdp: something else answered
+        // (Chrome on 9222, etc.). Both mean "this IDE has no usable CDP" —
+        // clear the cache so the next resolve can pick up a fresh
+        // DevToolsActivePort after we relaunch on port 0.
+        if (probed.kind === 'no-listener' || probed.kind === 'not-cdp') {
           clearEndpointCache(this.ideKind);
         }
         let issue = toCdpIssue(probed, 'workbench');
-        if (issue.kind === 'no-listener') {
+        // Self-heal whenever the IDE itself needs a debug port and the one we
+        // probed is empty or foreign. Historically only `no-listener` relaunched;
+        // `not-cdp` just painted "9222 被 Google 占着，关掉它或换端口" and sat
+        // there — every machine that shares 9222 with Chrome hit that wall.
+        // Relaunch always targets **this** IDE (never the occupant), and for
+        // `not-cdp` we must pass 0: the configured port is exactly the one
+        // that is occupied / not us, so asking Chromium to bind it again fails.
+        if (issue.kind === 'no-listener' || issue.kind === 'not-cdp') {
           // Judge "after restart, can we read the port back": compare mtime
           // **only between two relaunches** — 60s cooldown, so we naturally
           // do not misread "IDE started slowly, file not written yet" as
-          // "file location is wrong".
+          // "file location is wrong". Only meaningful for no-listener (empty
+          // port); not-cdp already proved the file/config port is the wrong
+          // process, so we never latch onto the configured port from here.
           if (
-            !this.fileLocationOff
+            issue.kind === 'no-listener'
+            && !this.fileLocationOff
             && this.hasRelaunched
             && this.lastFileMtime === this.mtimeAtLastRelaunch
           ) {
@@ -527,7 +541,10 @@ export class CDPBridge extends EventEmitter {
           // only after confirming "this IDE does not use the file we read" do we fall
           // back to the configured port — passing 0 then would forever read a dead
           // file, kill 3 times per 10 minutes, never recover (review Q2(B)).
-          const relaunchPort = this.fileLocationOff ? this.configuredPort : 0;
+          // not-cdp: always 0 (configured / file port is occupied by someone else).
+          const relaunchPort = issue.kind === 'not-cdp'
+            ? 0
+            : (this.fileLocationOff ? this.configuredPort : 0);
           const result = await this.relauncher.maybeRelaunch(relaunchPort);
           if (generation !== this.connectGeneration || this.isConnected())
             return;

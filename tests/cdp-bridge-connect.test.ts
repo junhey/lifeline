@@ -465,6 +465,66 @@ describe('CDPBridge.connect', () => {
     assert.equal(issues[0]?.relaunch, 'skipped-warming-up');
   });
 
+  it('self-heals when 9222 is occupied (not-cdp http) by relaunching on port 0', async () => {
+    // Chrome (or any non-IDE) holding the configured fallback port used to only
+    // surface "关掉它，或换一个端口" and never self-heal. Relaunch this IDE on
+    // a random port; never re-bind the occupied configured port.
+    const ports: number[] = [];
+    const issues: Array<CdpIssue | null> = [];
+    const bridge = new CDPBridge(dummyConfig(), {
+      relauncher: {
+        maybeRelaunch: async (port) => {
+          ports.push(port);
+          return 'relaunched';
+        },
+      },
+      probe: async () => probeFail('not-cdp', {
+        notCdpCause: 'http',
+        occupant: 'Google Chrome (pid 3132)',
+        detail: 'CDP target discovery failed: HTTP 404',
+      }),
+      createClient: () => new FakeCdpClient() as unknown as CdpClient,
+    });
+    bridge.on('issue', (issue: CdpIssue | null) => issues.push(issue));
+    bridge.on('error', () => {});
+
+    await bridge.connect();
+    await bridge.disconnect();
+
+    assert.deepEqual(ports, [0]);
+    assert.equal(issues[0]?.kind, 'not-cdp');
+    assert.equal(issues[0]?.notCdpCause, 'http');
+    assert.equal(issues[0]?.relaunch, 'relaunched');
+  });
+
+  it('self-heals a foreign CDP on the configured port with port 0 (not the configured port)', async () => {
+    const ports: number[] = [];
+    const issues: Array<CdpIssue | null> = [];
+    const bridge = new CDPBridge(dummyConfig(), {
+      relauncher: {
+        maybeRelaunch: async (port) => {
+          ports.push(port);
+          return 'relaunched';
+        },
+      },
+      probe: async () => probeFail('not-cdp', {
+        notCdpCause: 'foreign',
+        browser: 'Chrome/148.0.7778.280',
+        detail: 'CDP browser is Chrome/148.0.7778.280, not Cursor',
+      }),
+      createClient: () => new FakeCdpClient() as unknown as CdpClient,
+    });
+    bridge.on('issue', (issue: CdpIssue | null) => issues.push(issue));
+    bridge.on('error', () => {});
+
+    await bridge.connect();
+    await bridge.disconnect();
+
+    assert.deepEqual(ports, [0], 'occupied/foreign configured port must not be re-requested');
+    assert.equal(issues[0]?.kind, 'not-cdp');
+    assert.equal(issues[0]?.relaunch, 'relaunched');
+  });
+
   it('does not attach when probe returns no-window and emits that issue', async () => {
     let created = 0;
     let relaunch = 0;

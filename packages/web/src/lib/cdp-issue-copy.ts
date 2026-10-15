@@ -30,9 +30,37 @@ export function cdpIssueCopy(issue: CdpIssue, ideLabel: string): { tone: CdpIssu
       }
       return { tone: 'info', text: `连不上 ${ideLabel} 的调试端口` };
     case 'not-cdp':
+      // Self-heal relaunches this IDE on a random port (does not kill the occupant).
+      if (issue.relaunch === 'relaunched' || issue.relaunch === 'skipped-warming-up') {
+        return {
+          tone: 'progress',
+          text: `端口 ${issue.port} 不是 ${ideLabel}，正在用随机端口自动重启它…`,
+        };
+      }
+      if (issue.relaunch === 'skipped-cooldown') {
+        return {
+          tone: 'progress',
+          text: `端口 ${issue.port} 不是 ${ideLabel}；刚重启过，冷却后会自动换端口重试`,
+        };
+      }
+      if (issue.relaunch === 'skipped-throttled') {
+        return {
+          tone: 'warn',
+          text: `端口 ${issue.port} 不是 ${ideLabel}；短时间内重启过多，自动换端口已暂停`,
+        };
+      }
+      if (issue.relaunch === 'skipped-quit-pending') {
+        return {
+          tone: 'progress',
+          text: `端口 ${issue.port} 不是 ${ideLabel}；${ideLabel} 还没退出（可能有未保存内容），稍后会自动重试`,
+        };
+      }
       if (issue.notCdpCause === 'foreign') {
         const who = issue.browser?.trim() || '别的程序';
-        return { tone: 'warn', text: `端口 ${issue.port} 上是 ${who}，不是 ${ideLabel}` };
+        return {
+          tone: 'warn',
+          text: `端口 ${issue.port} 上是 ${who}，不是 ${ideLabel}；lifeline 会尝试用随机端口重启 ${ideLabel}`,
+        };
       }
       {
         const occupied = issue.occupant?.trim()
@@ -40,7 +68,7 @@ export function cdpIssueCopy(issue: CdpIssue, ideLabel: string): { tone: CdpIssu
           : '被占着';
         return {
           tone: 'warn',
-          text: `${issue.port} ${occupied}，lifeline 连不上 ${ideLabel}。关掉它，或换一个端口`,
+          text: `${issue.port} ${occupied}，lifeline 连不上 ${ideLabel}；会尝试用随机端口自动重启它`,
         };
       }
     case 'no-window':
