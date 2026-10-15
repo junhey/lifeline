@@ -35,17 +35,19 @@ describe('drivers registry', () => {
     }
   });
 
-  it('bridgeOptions: codebuddy carries title suffixes + app names + relauncher; cursor defaults', () => {
+  it('bridgeOptions: codebuddy carries suffixes + app names + relauncher + quietWake; cursor wires quietWake only', () => {
     const cb = DRIVERS.codebuddy!.bridgeOptions();
     assert.ok((cb.titleSuffixes ?? []).length > 0);
     assert.ok((cb.appNames ?? []).length > 0);
     assert.ok(cb.relauncher !== undefined);
+    assert.equal(typeof cb.quietWake?.isRunning, 'function');
 
     const cur = DRIVERS.cursor!.bridgeOptions();
-    // cursor takes CDPBridge defaults (titleSuffixes/appNames/relauncher all omitted)
+    // cursor 仍走 CDPBridge 默认 relauncher，但静默唤醒必须接进程探针
     assert.equal(cur.titleSuffixes, undefined);
     assert.equal(cur.appNames, undefined);
     assert.equal(cur.relauncher, undefined);
+    assert.equal(typeof cur.quietWake?.isRunning, 'function');
   });
 
   it('hasLiveApp / attachLive / detachLive / waitUntilReady are functions on every driver', () => {

@@ -17,7 +17,7 @@
  *   pnpm exec tsx scripts/probes/probe-session-db.ts --switches
  */
 import { execFileSync } from 'node:child_process';
-import { DEFAULT_CURSOR_VSCDB } from '../packages/agent/src/content-runtime.js';
+import { DEFAULT_CURSOR_VSCDB } from '../../packages/agent/src/content-runtime.js';
 
 interface Row {
   [column: string]: string | number | null;

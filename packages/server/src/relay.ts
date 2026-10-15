@@ -263,7 +263,7 @@ export class Relay {
       await this.gateHttp(req, reply);
     });
 
-    this.app.get('/healthz', async () => ({ ok: true }));
+    this.app.get('/healthz', async () => ({ ok: true, agents: this.agentHub.connectedAgentCount() }));
 
     this.app.get('/cli-setup', async (req, reply) => {
       const q = req.query as { redirect_uri?: string };

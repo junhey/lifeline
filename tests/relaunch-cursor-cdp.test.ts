@@ -5,7 +5,9 @@ import { describe, it } from 'node:test';
 import {
   cdpPortFromUrl,
   createIdeCdpRelauncher,
+  ideUpdaterPgrepPattern,
   isCdpUnreachable,
+  isIdeUpdaterRunningDarwin,
   isProcessRunningWin,
   memoizeExeWithTtl,
   nextReconnectDelay,
@@ -134,6 +136,82 @@ describe('createCursorCdpRelauncher', () => {
     assert.deepEqual(ctx.open, ['0']);
   });
 
+  // Regression (measured on a real machine): "restart and update" quits Cursor, ShipIt starts
+  // swapping the .app, and our self-heal `open -a Cursor` resurrects the old bundle mid-replace →
+  // ShipIt aborts ("App Still Running") and the update never lands.
+  it('does not quit or relaunch while the updater (ShipIt) is running with a staged update', async () => {
+    const logs: string[] = [];
+    let updaterRunning = true;
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      isCursorUpdaterRunning: () => updaterRunning,
+      log: m => logs.push(m),
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, cooldownMs: 60_000, deps: ctx.deps });
+    assert.equal(await relauncher.maybeRelaunch(0), 'skipped-update-in-progress');
+    assert.equal(ctx.quit, 0, '绝不能退一个正在被替换的应用');
+    assert.deepEqual(ctx.open, [], '绝不能用 open -a 把旧版本拉回来');
+    assert.equal(logs.length, 1);
+
+    // Update done (ShipIt exited): the next attempt must NOT slip into the cooldown branch —
+    // skipping never consumed cooldown (same invariant as skipped-no-exe).
+    updaterRunning = false;
+    assert.equal(await relauncher.maybeRelaunch(0), 'relaunched');
+    assert.equal(ctx.quit, 1);
+  });
+
+  it('logs the update-in-progress reason only once per episode', async () => {
+    const logs: string[] = [];
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      isCursorUpdaterRunning: () => true,
+      log: m => logs.push(m),
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, deps: ctx.deps });
+    await relauncher.maybeRelaunch(0);
+    await relauncher.maybeRelaunch(0);
+    assert.equal(logs.length, 1, '每 30s 的安静重连不该重复刷同一行');
+  });
+
+  it('relaunches normally when the updater is not running', async () => {
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      isCursorUpdaterRunning: () => false,
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, deps: ctx.deps });
+    assert.equal(await relauncher.maybeRelaunch(0), 'relaunched');
+    assert.equal(ctx.quit, 1);
+  });
+
+  // Order lock: the updater check must sit BEFORE the grace branch. If someone moves it after,
+  // this returns 'skipped-warming-up' → bridge's setIssue(issue) reports a fault instead of staying quiet.
+  it('skips for the updater even inside the warm-up grace window', async () => {
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      isCursorUpdaterRunning: () => true,
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 1500, deps: ctx.deps });
+    assert.equal(await relauncher.maybeRelaunch(0), 'skipped-update-in-progress');
+    assert.equal(ctx.quit, 0);
+    assert.deepEqual(ctx.open, []);
+  });
+
+  it('clears the updater log dedupe after a successful connect', async () => {
+    const logs: string[] = [];
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      isCursorUpdaterRunning: () => true,
+      log: m => logs.push(m),
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, deps: ctx.deps });
+    await relauncher.maybeRelaunch(0);
+    await relauncher.maybeRelaunch(0);
+    assert.equal(logs.length, 1, '每 30s 的安静重连不该重复刷同一行');
+    relauncher.noteConnected();
+    await relauncher.maybeRelaunch(0);
+    assert.equal(logs.length, 2, '连上过之后重置，问题还在就能再报一次');
+  });
+
   it('does not open a second instance if quit did not finish', async () => {
     const ctx = fakeDeps({
       isCursorRunning: () => true,
@@ -180,7 +258,8 @@ describe('createCursorCdpRelauncher', () => {
   it('does not count a failed quit against the burst guard', async () => {
     let now = 10_000;
     let quitTries = 0;
-    // A save dialog is blocking → there was never a real relaunch, so it must not count as "repeated false relaunch"
+    // A save dialog is blocking → there was never a real relaunch, so it must not count as "repeated false relaunch".
+    // 步进按 quit-pending 的短门限（15s + 1s 余量）走：冷却已不再给失败 quit 计时。
     const ctx = fakeDeps({
       isCursorRunning: () => true,
       now: () => now,
@@ -191,17 +270,141 @@ describe('createCursorCdpRelauncher', () => {
     });
     const relauncher = createCursorCdpRelauncher({
       graceMs: 0,
-      cooldownMs: 1_000,
-      burstWindowMs: 10_000,
+      burstWindowMs: 120_000,
       burstMax: 1,
       deps: ctx.deps,
     });
     for (let i = 0; i < 4; i++) {
       assert.equal(await relauncher.maybeRelaunch(0), 'skipped-quit-pending');
-      now += 2_000;
+      now += 16_000;
     }
     assert.equal(quitTries, 4, '每次都试了退出');
     assert.deepEqual(ctx.open, [], '一次都没真拉起 → 不该入账，所以永远不会被 throttle');
+  });
+
+  it('retries a failed quit after the short gate instead of the 60s cooldown', async () => {
+    let now = 10_000;
+    let quitCalls = 0;
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      now: () => now,
+      quitCursor: async () => {
+        quitCalls += 1;
+        return false;
+      },
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, cooldownMs: 60_000, deps: ctx.deps });
+    assert.equal(await relauncher.maybeRelaunch(9222), 'skipped-quit-pending');
+    assert.equal(quitCalls, 1);
+    now = 11_000;
+    assert.equal(await relauncher.maybeRelaunch(9222), 'skipped-quit-pending');
+    assert.equal(quitCalls, 1, '15s 门内不重复动手');
+    now = 26_000;
+    assert.equal(await relauncher.maybeRelaunch(9222), 'skipped-quit-pending');
+    assert.equal(quitCalls, 2, '15s 后重试，不等 60s 冷却');
+  });
+
+  // 一次失败的 quit 本身要花 25–35s（osascript + 轮询）。若门限锚在动手前，
+  // 返回时门已过期 → 每个重连周期都立刻再 quit。锚必须在 quit 返回时。
+  it('paces the quit retry from when the failed quit returned, not when it started', async () => {
+    let now = 10_000;
+    let quitCalls = 0;
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      now: () => now,
+      quitCursor: async () => {
+        quitCalls += 1;
+        now += 20_000; // 一次失败尝试的真实耗时
+        return false;
+      },
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, cooldownMs: 60_000, deps: ctx.deps });
+    assert.equal(await relauncher.maybeRelaunch(9222), 'skipped-quit-pending'); // now → 30_000
+    assert.equal(await relauncher.maybeRelaunch(9222), 'skipped-quit-pending');
+    assert.equal(quitCalls, 1, '门限从 quit 返回时起算，不从动手时');
+    now = 45_001;
+    assert.equal(await relauncher.maybeRelaunch(9222), 'skipped-quit-pending');
+    assert.equal(quitCalls, 2);
+  });
+
+  it('a failed quit does not consume the relaunch cooldown', async () => {
+    let now = 10_000;
+    let quitFails = true;
+    let quitCalls = 0;
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      now: () => now,
+      quitCursor: async () => {
+        quitCalls += 1;
+        return !quitFails;
+      },
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, cooldownMs: 60_000, deps: ctx.deps });
+    assert.equal(await relauncher.maybeRelaunch(9222), 'skipped-quit-pending');
+    quitFails = false;
+    now = 26_000; // 仍在 60s 冷却窗内 —— 没做过动作就不该被冷却拦
+    assert.equal(await relauncher.maybeRelaunch(9222), 'relaunched');
+    assert.equal(quitCalls, 2);
+    assert.deepEqual(ctx.open, ['9222']);
+  });
+
+  it('logs a failed quit once per episode, re-arms after noteConnected', async () => {
+    const logs: string[] = [];
+    let now = 10_000;
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      now: () => now,
+      quitCursor: async () => false,
+      log: m => logs.push(m),
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, deps: ctx.deps });
+    await relauncher.maybeRelaunch(9222);
+    now = 30_000; // 出门后的第二次失败
+    await relauncher.maybeRelaunch(9222);
+    assert.equal(logs.filter(l => l.includes('did not quit')).length, 1, '同一 episode 只报一次');
+    // 动手意图那行同样每 episode 一次 —— 保存弹窗卡住期间不得每轮刷两行
+    assert.equal(logs.filter(l => l.includes('quitting and relaunching')).length, 1, '动手意图同样每 episode 一次');
+    relauncher.noteConnected();
+    now = 60_000;
+    await relauncher.maybeRelaunch(9222);
+    assert.equal(logs.filter(l => l.includes('did not quit')).length, 2, '连上过之后问题还在就能再报');
+    assert.equal(logs.filter(l => l.includes('quitting and relaunching')).length, 2);
+  });
+
+  it('logs the burst-fuse message once per episode', async () => {
+    const logs: string[] = [];
+    let now = 10_000;
+    const ctx = fakeDeps({ isCursorRunning: () => true, now: () => now, log: m => logs.push(m) });
+    const relauncher = createCursorCdpRelauncher({
+      graceMs: 0,
+      cooldownMs: 1_000,
+      burstWindowMs: 120_000,
+      burstMax: 1,
+      deps: ctx.deps,
+    });
+    await relauncher.maybeRelaunch(0); // relaunched
+    now += 2_000;
+    await relauncher.maybeRelaunch(0); // throttled
+    now += 2_000;
+    await relauncher.maybeRelaunch(0); // throttled again
+    assert.equal(logs.filter(l => l.includes('NOT killing it again')).length, 1, '保险丝日志每 episode 一次');
+  });
+
+  // 钉住既有语义（前后都应绿）：拉起失败必须吃冷却 —— 那是"杀了没拉起"的最坏场景
+  it('still consumes the cooldown when the open fails after a successful quit', async () => {
+    let now = 10_000;
+    const ctx = fakeDeps({
+      isCursorRunning: () => true,
+      now: () => now,
+      openCursorWithCdp: async () => {
+        throw new Error('open failed');
+      },
+    });
+    const relauncher = createCursorCdpRelauncher({ graceMs: 0, cooldownMs: 60_000, deps: ctx.deps });
+    await assert.rejects(() => relauncher.maybeRelaunch(9222), /open failed/);
+    now = 20_000;
+    assert.equal(await relauncher.maybeRelaunch(9222), 'skipped-cooldown');
+    assert.equal(ctx.quit, 1);
   });
 
   it('clears the burst counter once we are connected again', async () => {
@@ -330,6 +533,31 @@ describe('RELAUNCH_PLATFORMS', () => {
     for (const p of ['darwin', 'win32', 'linux', 'freebsd'] as const) {
       assert.equal(RELAUNCH_PLATFORMS.includes(p), canControlIde(p), `platform ${p}`);
     }
+  });
+});
+
+describe('isIdeUpdaterRunningDarwin', () => {
+  it('pgreps for the ShipIt binary inside the app bundle', () => {
+    const seen: string[][] = [];
+    isIdeUpdaterRunningDarwin('Cursor', { run: fakeRun('79766\n', seen) });
+    assert.deepEqual(seen[0], [
+      'pgrep',
+      '-f',
+      '(^|/)Cursor\\.app/Contents/Frameworks/Squirrel\\.framework/Resources/ShipIt',
+    ]);
+  });
+
+  // An unanchored substring would also match some other app whose bundle name ends with ours
+  // (`NotCursor.app/…` contains `Cursor.app/…`) → this IDE's self-heal silently suppressed.
+  it('anchors the app name so NotCursor.app does not match Cursor', () => {
+    assert.doesNotMatch('/Applications/NotCursor.app/Contents/Frameworks/Squirrel.framework/Resources/ShipIt', new RegExp(ideUpdaterPgrepPattern('Cursor')));
+    assert.match('/Applications/Cursor.app/Contents/Frameworks/Squirrel.framework/Resources/ShipIt', new RegExp(ideUpdaterPgrepPattern('Cursor')));
+    assert.match('/Users/x/Apps/Cursor.app/Contents/Frameworks/Squirrel.framework/Resources/ShipIt', new RegExp(ideUpdaterPgrepPattern('Cursor')));
+  });
+
+  it('is true while ShipIt is resident, false once it exits', () => {
+    assert.equal(isIdeUpdaterRunningDarwin('Cursor', { run: fakeRun('79766\n') }), true);
+    assert.equal(isIdeUpdaterRunningDarwin('Cursor', { run: fakeRun('') }), false);
   });
 });
 

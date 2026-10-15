@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 export type RelaunchResult
   = | 'relaunched'
     | 'skipped-not-running'
+    | 'skipped-update-in-progress'
     | 'skipped-cooldown'
     | 'skipped-platform'
     | 'skipped-quit-pending'
@@ -38,6 +39,15 @@ export interface IdeCdpRelaunchDeps {
    * `undefined` = do not check. **Ask before quitting**: if we cannot launch, we must not quit.
    */
   canRelaunch?: () => boolean;
+  /**
+   * Whether the IDE's updater (Squirrel/ShipIt, ToDesktop flavor) is currently
+   * running with a staged update. **Measured**: after the user clicks
+   * "restart and update", ShipIt stays resident waiting for the app to quit,
+   * then needs 8–15s to swap the whole `.app`. If we self-heal (`open -a`) in
+   * that window we relaunch the **old** bundle mid-replace → ShipIt aborts with
+   * "App Still Running" and the update never lands. See `skipped-update-in-progress`.
+   */
+  isUpdaterRunning?: () => boolean;
   quit: () => Promise<boolean>;
   openWithCdp: (port: number) => Promise<void>;
   log: (msg: string) => void;
@@ -45,6 +55,14 @@ export interface IdeCdpRelaunchDeps {
 
 export const CDP_RELAUNCH_COOLDOWN_MS = 60_000;
 export const CDP_RELAUNCH_GRACE_MS = 1_500;
+/**
+ * Retry gate for a quit that did not finish (save dialog / already exiting).
+ * **Must stay well under the cooldown**: a failed quit took no action, so the
+ * 60s cooldown (which protects real quit+reopen cycles) no longer applies —
+ * this gate is the only pacing. 15s ≈ one quit attempt's own cost (osascript
+ * 10s timeout + quit poll), so attempts do not queue behind each other.
+ */
+export const QUIT_PENDING_RETRY_MS = 15_000;
 const DEFAULT_COOLDOWN_MS = CDP_RELAUNCH_COOLDOWN_MS;
 const DEFAULT_GRACE_MS = CDP_RELAUNCH_GRACE_MS;
 const UNREACHABLE_POLL_MS = 500;
@@ -134,6 +152,17 @@ export function createIdeCdpRelauncher(opts: {
    * report once more.
    */
   let noExeLogged = false;
+  /** Same de-dupe rationale as `noExeLogged`: hit once per 30s reconnect, so log once per episode. */
+  let updaterLogged = false;
+  /**
+   * Last failed-quit timestamp (`QUIT_PENDING_RETRY_MS` gate) + its episode
+   * log flag. A gated retry must not re-log — it is "still the same stuck
+   * quit", not a new failure.
+   */
+  let lastQuitPendingAt = 0;
+  let quitPendingLogged = false;
+  /** Burst-fuse log, once per episode (same rationale as `quitPendingLogged`). */
+  let throttleLogged = false;
 
   return {
     async maybeRelaunch(port: number): Promise<RelaunchResult> {
@@ -142,6 +171,23 @@ export function createIdeCdpRelauncher(opts: {
       if (!deps.isRunning()) {
         seenRunningAt = 0;
         return 'skipped-not-running';
+      }
+      // **Update in flight**: the IDE is running (or just quit itself) and its
+      // updater is about to swap the `.app`. Do NOT quit+reopen here —
+      // `open -a` would resurrect the old bundle mid-install and abort the
+      // update ("App Still Running"). ShipIt relaunches the new version
+      // itself; we reconnect to it on the next quiet poll.
+      // Like `skipped-no-exe`: must sit **before** `lastAttempt = now` so it
+      // consumes neither cooldown nor burst attempts.
+      if (deps.isUpdaterRunning?.()) {
+        if (!updaterLogged) {
+          updaterLogged = true;
+          deps.log(
+            `${productName} update is in progress (its updater is running); NOT relaunching it — `
+            + 'waiting for the installer to finish and start the new version',
+          );
+        }
+        return 'skipped-update-in-progress';
       }
       const now = deps.now();
       if (seenRunningAt === 0)
@@ -153,11 +199,14 @@ export function createIdeCdpRelauncher(opts: {
       // Rate fuse: cooldown only guarantees "not consecutive"; it does not stop "once every 60s, forever" (review R3 reproduced 3 times).
       attempts = attempts.filter(t => now - t < burstWindowMs);
       if (attempts.length >= burstMax) {
-        deps.log(
-          `${productName} has been relaunched ${attempts.length} time(s) in the last `
-          + `${Math.round(burstWindowMs / 60_000)}min; NOT killing it again. `
-          + 'Check the CDP endpoint / DevToolsActivePort before the next attempt.',
-        );
+        if (!throttleLogged) {
+          throttleLogged = true;
+          deps.log(
+            `${productName} has been relaunched ${attempts.length} time(s) in the last `
+            + `${Math.round(burstWindowMs / 60_000)}min; NOT killing it again. `
+            + 'Check the CDP endpoint / DevToolsActivePort before the next attempt.',
+          );
+        }
         return 'skipped-throttled';
       }
       // "Quit first, then launch" has a trap: **if we cannot launch, we have
@@ -181,16 +230,43 @@ export function createIdeCdpRelauncher(opts: {
         }
         return 'skipped-no-exe';
       }
-      // Cooldown uses lastAttempt, **not recorded as an attempt**: the user just opened a save dialog, not a mistaken relaunch.
-      lastAttempt = now;
-      deps.log(
-        `${productName} is running without CDP; quitting and relaunching with --remote-debugging-port=${port}`,
-      );
+      // A previous quit did not finish: pace with the short gate, not the 60s
+      // cooldown — no action was taken, so the cooldown does not apply.
+      // Silent on purpose: the attempt that failed already logged this episode.
+      if (lastQuitPendingAt > 0 && now - lastQuitPendingAt < QUIT_PENDING_RETRY_MS)
+        return 'skipped-quit-pending';
+      // Same episode rule as `noExeLogged`: a stuck quit can persist for hours
+      // (save dialog); the intent line must not repeat every retry.
+      if (!quitPendingLogged) {
+        deps.log(
+          `${productName} is running without CDP; quitting and relaunching with --remote-debugging-port=${port}`,
+        );
+      }
       const quit = await deps.quit();
       if (!quit) {
-        deps.log(`${productName} did not quit (save dialog or already exiting); will retry later`);
+        // Anchor at the **return** time: a failed quit itself takes 25–35s
+        // (osascript + quit poll), so an anchor taken before it would already
+        // be past the gate when we get here → every reconnect quits again.
+        lastQuitPendingAt = deps.now();
+        if (!quitPendingLogged) {
+          quitPendingLogged = true;
+          deps.log(
+            `${productName} did not quit (save dialog or already exiting); will retry in `
+            + `${Math.round(QUIT_PENDING_RETRY_MS / 1000)}s`,
+          );
+        }
         return 'skipped-quit-pending';
       }
+      // Cooldown protects **real actions**: record only after the quit
+      // succeeded — recording before it made a "did not quit" wait out the
+      // full 60s for nothing (the quit-pending gate does the pacing now).
+      // Must still be recorded **before** openWithCdp: if the open fails we
+      // have just closed the user's IDE, and a fast-poll retry loop there is
+      // the worse evil.
+      lastAttempt = now;
+      lastQuitPendingAt = 0;
+      quitPendingLogged = false;
+      throttleLogged = false;
       // Only count it once we actually quit and relaunched.
       attempts.push(now);
       seenRunningAt = 0;
@@ -211,8 +287,44 @@ export function createIdeCdpRelauncher(opts: {
       lastAttempt = 0;
       attempts = [];
       noExeLogged = false;
+      updaterLogged = false;
+      lastQuitPendingAt = 0;
+      quitPendingLogged = false;
+      throttleLogged = false;
     },
   };
+}
+
+/**
+ * macOS: is this IDE's updater (Squirrel/ShipIt — Cursor & CodeBuddy both use
+ * the ToDesktop flavor) running? Measured after "restart and update":
+ * `…/<App>.app/Contents/Frameworks/Squirrel.framework/Resources/ShipIt` stays
+ * resident while a staged update waits for the app to quit, and exits once the
+ * install finishes. Path suffix match (no `/Applications/` prefix) so custom
+ * install dirs still hit.
+ *
+ * **Anchored + escaped** (`(^|/)Cursor\.app/…`): an unanchored substring would
+ * also match some other app whose bundle name merely **ends** with ours
+ * (`NotCursor.app/…` contains `Cursor.app/…`), silently suppressing this IDE's
+ * self-heal for as long as that unrelated update runs.
+ */
+export function ideUpdaterPgrepPattern(appName: string): string {
+  const escaped = appName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return `(^|/)${escaped}\\.app/Contents/Frameworks/Squirrel\\.framework/Resources/ShipIt`;
+}
+
+export function isIdeUpdaterRunningDarwin(appName: string, deps: WinProcDeps = {}): boolean {
+  const run = deps.run ?? spawnSync;
+  try {
+    const r = run('pgrep', ['-f', ideUpdaterPgrepPattern(appName)], {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    return r.status === 0 && Boolean(r.stdout?.trim());
+  }
+  catch {
+    return false;
+  }
 }
 
 /** First field of each `tasklist /NH /FO CSV` row (image name). On no match there is only an `INFO:` line → `[]`. */

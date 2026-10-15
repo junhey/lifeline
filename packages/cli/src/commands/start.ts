@@ -3,9 +3,31 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applyCodeBuddyCdpArgv, applyCursorCdpArgv } from '../cdp-argv-state.js';
 import { ensureAgentId, saveCliConfig } from '../config.js';
+import { detectServiceInvocation } from '../daemon/service-context.js';
 import { log, requireConfig } from '../ui.js';
+import { daemonProbe, ensureDaemon } from './daemon.js';
 
 export async function cmdStart(): Promise<void> {
+  const argv = process.argv.slice(2);
+  // Foreground is not a service respawn: a debug run must refuse while the service is up.
+  if (argv.includes('--foreground') || argv.includes('-f')) {
+    if (daemonProbe().running) {
+      console.error('The background agent is already running. `lifeline stop` must come first.');
+      process.exit(1);
+    }
+    await runAgent();
+    return;
+  }
+  if (detectServiceInvocation(argv)) {
+    await runAgent();
+    return;
+  }
+  const outcome = ensureDaemon();
+  if (outcome && !outcome.ok)
+    process.exit(1);
+}
+
+export async function runAgent(): Promise<void> {
   const config = ensureAgentId(requireConfig());
 
   try {

@@ -500,13 +500,18 @@ describe('ContentLiveRuntime', () => {
     assert.equal(rec2.patch.length, 0);
   });
 
-  it('sends only the delta when the disk moved while the process was down', () => {
+  // A restored watermark has the disk index but not the emitted element array, so a delta can't be numbered
+  // globally: it used to go out numbered from 0, collide with the rows the server already held, and the server
+  // (ORDER BY flat_index) interleaved the newest turns into the middle of the session (2026-09-30).
+  // After a restart the disk moving means one authoritative full, with unique consecutive flatIndex.
+  it('re-sends a numbered full (never a 0-based delta) when the disk moved while the process was down', () => {
     seed();
     adapter = new CursorAdapter(dbPath);
     const rec = recorder();
     const rt = new ContentLiveRuntime(adapter, rec.handlers);
     rt.setActiveSession('cid1');
     rt.tick();
+    const baseline = rec.full[0].messages.length;
     const snapshot = rt.watermarkSnapshot();
 
     addAssistant('a9', 'written while we were down');
@@ -514,9 +519,36 @@ describe('ContentLiveRuntime', () => {
     const rec2 = recorder();
     const rt2 = new ContentLiveRuntime(adapter, rec2.handlers, { watermark: snapshot });
     rt2.requestSession('cid1', 0);
-    assert.equal(rec2.full.length, 0);
     assert.equal(rec2.sync.length, 0, '盘变了，不能只回 sync');
-    assert.deepEqual(rec2.patch[0].messages.map(m => m.id), ['a9']);
+    assert.equal(rec2.patch.length, 0, '没有发送基线时不能发增量');
+    assert.equal(rec2.full.length, 1);
+    const flat = rec2.full[0].messages.map(m => (m as { flatIndex: number }).flatIndex);
+    assert.equal(flat.length, baseline + 1);
+    assert.deepEqual(flat, flat.map((_, i) => i), 'flatIndex must be unique and consecutive from 0');
+    assert.ok(rec2.full[0].messages.some(m => m.id === 'a9'));
+  });
+
+  it('keeps global flatIndex for appends after a restart (first tick after restore heals with a full)', () => {
+    seed();
+    adapter = new CursorAdapter(dbPath);
+    const rec = recorder();
+    const rt = new ContentLiveRuntime(adapter, rec.handlers);
+    rt.setActiveSession('cid1');
+    rt.tick();
+    const baseline = rec.full[0].messages.length;
+    const snapshot = rt.watermarkSnapshot();
+
+    const rec2 = recorder();
+    const rt2 = new ContentLiveRuntime(adapter, rec2.handlers, { watermark: snapshot });
+    rt2.setActiveSession('cid1');
+    addAssistant('a9', 'new message after restart');
+    rt2.tick();
+
+    // No append may restart at 0: either a full (globally numbered) or an append that continues at `baseline`.
+    const sent = [...rec2.full.map(f => f.messages), ...rec2.append.map(a => a.messages)];
+    assert.ok(sent.length > 0, 'the new message must reach the server');
+    const a9 = sent.flat().find(m => m.id === 'a9') as { flatIndex: number } | undefined;
+    assert.equal(a9?.flatIndex, baseline, 'the new message keeps its global position');
   });
 
   it('appends new ids after disk change', () => {
@@ -567,7 +599,7 @@ describe('ContentLiveRuntime', () => {
     assert.equal(first.text, 'ok from the live DOM');
 
     // 归属错（liveTail 指向不存在的 a2）→ a1 任何时刻都不得挂上 a2 声称的文字。
-    // （磁盘自愈重读会在后续 tick 把 a1 拉回磁盘真值——那是期望行为；
+    // （Task 3 落地后这一拍会触发磁盘自愈 append——a1 回到磁盘真值——那是期望行为；
     //  这里只锁「外来文字绝不出现」。）
     rt.tick({ liveTail: { sessionId: 'cid1', messageId: 'a2', text: 'text that belongs to another message' } });
     const emitted1 = [...rec.full, ...rec.append, ...rec.patch].flatMap(e => e.messages);

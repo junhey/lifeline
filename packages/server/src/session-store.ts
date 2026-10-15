@@ -40,6 +40,67 @@ function payloadJson(message: ChatElement): string {
   return JSON.stringify(stripSensitive(message));
 }
 
+/**
+ * The mirror orders a session by `flat_index`, and that number is chosen by the agent. An agent that lost its
+ * send baseline (restart, restored watermark, …) numbers new messages from 0 and lands them on top of rows the
+ * server already holds; the read then interleaves them by `flat_index` and the newest turns end up buried mid-session
+ * (2026-09-30: 48 old rows + 27 new ones all in 0..47, tail stuck on old messages). The server must not let a
+ * wrong number from the wire corrupt the order, so before writing an incoming batch it settles collisions:
+ *  - a slot held by a row this batch does not touch is settled — the incoming message may not take it;
+ *  - a message already stored goes back to the slot it already had (a streamed update re-sent with a stale number);
+ *  - a new message goes after the current tail, in batch order.
+ * Anything that does not collide is written as given, so a `patch-all` (a full, correctly numbered projection that
+ * legitimately shifts rows) passes through untouched.
+ */
+export function resolveFlatIndices(
+  existing: ReadonlyMap<string, number>,
+  incoming: ChatElement[],
+): { messages: ChatElement[]; moved: number } {
+  const incomingIds = new Set(incoming.map(m => m.id));
+  const taken = new Map<number, string>();
+  let tail = -1;
+  for (const [id, flat] of existing) {
+    if (flat > tail)
+      tail = flat;
+    if (!incomingIds.has(id))
+      taken.set(flat, id);
+  }
+
+  const accepted: Array<number | undefined> = [];
+  for (const m of incoming) {
+    const holder = taken.get(m.flatIndex);
+    if (holder === undefined || holder === m.id) {
+      taken.set(m.flatIndex, m.id);
+      accepted.push(m.flatIndex);
+      if (m.flatIndex > tail)
+        tail = m.flatIndex;
+      continue;
+    }
+    const prev = existing.get(m.id);
+    if (prev !== undefined && !taken.has(prev)) {
+      taken.set(prev, m.id);
+      accepted.push(prev);
+    }
+    else {
+      accepted.push(undefined);
+    }
+  }
+
+  let moved = 0;
+  const messages = incoming.map((m, i) => {
+    let flatIndex = accepted[i];
+    if (flatIndex === undefined) {
+      tail += 1;
+      flatIndex = tail;
+    }
+    if (flatIndex === m.flatIndex)
+      return m;
+    moved += 1;
+    return { ...m, flatIndex } as ChatElement;
+  });
+  return { messages, moved };
+}
+
 function sessionIde(session: SessionMeta): IdeKind {
   return parseIde(session.ref?.ide);
 }
@@ -357,8 +418,36 @@ export class SessionStore {
     ide: IdeKind,
     seq?: number,
   ): ChatElement[] {
+    this.appendMessages(agentId, sessionId, incoming, ide, seq);
+    return this.readSession(agentId, sessionId, ide) ?? [];
+  }
+
+  /**
+   * Merge a batch into the mirror by id and return what was actually stored: identical to `incoming` unless the
+   * agent's `flatIndex` collided with rows already held (see `resolveFlatIndices`). Forward the returned copy to
+   * watchers so the web sees the same order the DB serves.
+   */
+  appendMessages(
+    agentId: string,
+    sessionId: string,
+    incoming: ChatElement[],
+    ide: IdeKind,
+    seq?: number,
+  ): ChatElement[] {
+    let stored = incoming;
     const apply = this.sqlite.transaction(() => {
-      for (const message of incoming) {
+      const held = this.orm
+        .select({ messageId: messages.messageId, flatIndex: messages.flatIndex })
+        .from(messages)
+        .where(
+          and(eq(messages.agentId, agentId), eq(messages.ide, ide), eq(messages.sessionId, sessionId)),
+        )
+        .all();
+      const resolved = resolveFlatIndices(new Map(held.map(r => [r.messageId, r.flatIndex])), incoming);
+      stored = resolved.messages;
+      if (resolved.moved > 0)
+        console.warn(`[session-store] ${sessionId.slice(0, 8)}: renumbered ${resolved.moved}/${incoming.length} colliding flatIndex`);
+      for (const message of stored) {
         this.orm
           .insert(messages)
           .values({
@@ -382,6 +471,6 @@ export class SessionStore {
         this.upsertSeq(agentId, ide, sessionId, seq);
     });
     apply();
-    return this.readSession(agentId, sessionId, ide) ?? [];
+    return stored;
   }
 }

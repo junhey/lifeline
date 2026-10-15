@@ -9,6 +9,7 @@ import {
   createIdeCdpRelauncher,
   defaultQueryRegistry,
   defaultQueryUninstallRegistry,
+  isIdeUpdaterRunningDarwin,
   isProcessRunningWin,
   memoizeExeWithTtl,
 
@@ -34,6 +35,8 @@ export interface CursorCdpRelaunchDeps {
   now: () => number;
   isCursorRunning: () => boolean;
   canRelaunch?: () => boolean;
+  /** macOS only: ShipIt resident with a staged update → the relauncher must stand down (see `relaunch-engine.ts`). */
+  isCursorUpdaterRunning?: () => boolean;
   quitCursor: () => Promise<boolean>;
   openCursorWithCdp: (port: number) => Promise<void>;
   log: (msg: string) => void;
@@ -60,6 +63,7 @@ export function createCursorCdpRelauncher(opts: {
       now: opts.deps.now,
       isRunning: opts.deps.isCursorRunning,
       canRelaunch: opts.deps.canRelaunch,
+      isUpdaterRunning: opts.deps.isCursorUpdaterRunning,
       quit: opts.deps.quitCursor,
       openWithCdp: opts.deps.openCursorWithCdp,
       log: opts.deps.log,
@@ -126,6 +130,11 @@ export function defaultCursorCdpRelaunchDeps(opts: { exeTtlMs?: number } = {}): 
     platform: process.platform,
     now: () => Date.now(),
     isCursorRunning: win ? isCursorRunningWin : isCursorRunningDarwin,
+    // macOS only: on win32 Cursor updates via Squirrel's Update.exe with an image
+    // name too generic to attribute ("Update.exe"), so no check there — the
+    // macOS race (ShipIt swapping the .app while `open -a` resurrects it) is
+    // the measured failure; Windows relaunches go through the resolved exe.
+    isCursorUpdaterRunning: win ? undefined : () => isIdeUpdaterRunningDarwin('Cursor'),
     // Pre-check on win32 only: macOS uses `open -a Cursor`, LaunchServices resolves the app, there is no "path not found" case.
     canRelaunch: win ? () => resolveExe() !== undefined : undefined,
     quitCursor: win ? quitCursorWin : quitCursorDarwin,

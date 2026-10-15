@@ -18,9 +18,8 @@ import { groupTabsBySection, groupTabsByWindow } from '../lib/window-order';
 import { sendCommand, socket } from '../net/socket';
 import {
   isDraftTab,
-  isSessionWorking,
+  isRowWorking,
   isSyntheticComposerId,
-  isTabRunning,
   isTabUnread,
   isViewingTab,
   pendingMatchesTab,
@@ -31,7 +30,7 @@ import { sessionBodyKey, useSessionsStore } from '../store/sessions';
 import { useUiStore } from '../store/ui';
 
 /**
- * Running → spinner (IDE sidebar row-level status is canonical; the active row in this window also falls back to live session state so the spinner stays on after a switch);
+ * Running → spinner (IDE sidebar row-level status is canonical; only a row without a status of its own — old agent / extraction gap — falls back to the live session state so the spinner stays on after a switch);
  * Waiting for approval → badge; finished but not yet viewed → green dot (the one on the IDE session tab); read → no marker.
  * `viewing` (counts as soon as an optimistic switch starts) is the equivalent of "this window's active row".
  *
@@ -42,9 +41,9 @@ function tabBadge(tab: ChatTab, state: CursorState, isActiveWindow: boolean) {
   const spinner = (
     <CircleNotch size={13} weight="bold" color="var(--accent)" className="shrink-0 animate-spin" aria-label="进行中" />
   );
-  /** Active row in this window: if row-level status is missing, fall back to live session state (old server / extraction gap) so the spinner does not go out */
+  /** Active row in this window: the row's own status wins; the window-level live state only stands in while the row has none (see isRowWorking) */
   const viewingHere = tab.isActive && isActiveWindow;
-  if (isTabRunning(tab) || (viewingHere && isSessionWorking(state)))
+  if (isRowWorking(tab, state, viewingHere))
     return spinner;
   if (viewingHere) {
     const n = state.pendingApprovals?.length ?? 0;

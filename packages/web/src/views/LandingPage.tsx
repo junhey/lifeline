@@ -38,11 +38,10 @@ const FEATURES = [
   },
 ];
 
-// Naming in the middle section matches the CLI: the user has two commands (`lifeline setup` / `lifeline daemon`);
-// the product's own word is daemon, not agent (that's an internal name in the launchd label).
+// The middle row describes the background agent on the machine. It is not a command the user types.
 const FLOW = [
   ['本机 IDE', 'Cursor / CodeBuddy，CDP 只连 127.0.0.1'],
-  ['lifeline daemon', '装在那台电脑上的守护进程，主动出站，不需要公网入口'],
+  ['后台 agent', '装在那台电脑上，主动出站，不需要公网入口'],
   ['server', '中继 + 静态页；手机浏览器打开就接上'],
 ] as const;
 

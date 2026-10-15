@@ -115,6 +115,12 @@ export interface AgentsWindowDump {
   activeComposerId: string;
   /** `data-composer-status`：cancelled / needs_attention / done / in_progress / draft / archived。 */
   composerStatus: string;
+  /**
+   * Whether the composer's submit button is currently in stop state — the live
+   * "session itself is generating" truth (same read as CURSOR_STOP_JS). Optional:
+   * old dumps / test fixtures without it fall back to composerStatus only.
+   */
+  stopGenerating?: boolean;
   inputAvailable: boolean;
   /**
    * Text currently in the composer (the not-yet-sent part) — a draft's text is here.
@@ -422,10 +428,19 @@ export function dumpAgentsWindow(): AgentsWindowDump {
     '.ui-prompt-input-editor__input:not(.ui-prompt-input-tiptap-readonly__content)',
   )).find(el => !el.closest('[class*="glass-questionnaire-tray"]'));
 
+  // Stop button = the open session itself is generating (live truth, same read
+  // as CURSOR_STOP_JS; `data-composer-status` can lag behind it).
+  const stopGenerating = Array.from(document.querySelectorAll('button.ui-prompt-input-submit-button'))
+    .some((b) => {
+      const disabled = b.getAttribute('disabled') !== null || (b as HTMLButtonElement).disabled === true;
+      return !disabled && /^(?:stop|停止)/i.test((b.getAttribute('aria-label') || '').trim());
+    });
+
   return {
     sections,
     activeComposerId: bar?.getAttribute('data-composer-id') || '',
     composerStatus: bar?.getAttribute('data-composer-status') || '',
+    stopGenerating,
     inputAvailable: !!composerEl,
     inputText: composerEl ? (composerEl.textContent || '').trim() : '',
     approvals,
@@ -684,6 +699,14 @@ export function mapAgentsWindowDump(
    * flattened); clicking it (switch_tab) will pick it up on the next extract.
    */
   const activeInputText = activeIsCloud ? '' : (dump.inputText ?? '').trim();
+  /**
+   * Whether the open session itself is generating: the stop button (live
+   * truth) or a generating composer status. When false, the active row's
+   * spinner only mirrors **background sub-agents** of a multitask
+   * delegation — the session is already finished (measured 2026-09-30:
+   * composerStatus completed + row spinner for the whole background run).
+   */
+  const sessionGenerating = dump.stopGenerating === true || dump.composerStatus === 'in_progress';
   const tabs: ChatTab[] = [];
   for (const section of sections) {
     const ids = opts.resolveIds === false
@@ -712,6 +735,9 @@ export function mapAgentsWindowDump(
         // Draft: no body yet (the web must not fill in the previous session's body); text is in the composer.
         ...(draft ? { isDraft: true } : {}),
         ...(draft && row.active && activeInputText ? { draftText: activeInputText } : {}),
+        // Multitask delegation: row spinner = background sub-agents only — keep the
+        // row marker (IDE sidebar shows the same spinner) but flag it not-in-progress.
+        ...(row.active && row.running && !sessionGenerating ? { backgroundRunning: true } : {}),
       });
     }
   }
@@ -719,11 +745,15 @@ export function mapAgentsWindowDump(
   // Global agentStatus first looks at the current row's row-level truth
   // (spinner / pending approval); it is newer than data-composer-status:
   // the latter is the session's own persisted status (still completed after it finished).
+  // Exception — multitask delegation: the active row's spinner can mirror background
+  // sub-agents while the session itself is done (no stop button, terminal composer
+  // status). Then the row keeps its marker, but the window-level status must not
+  // claim "generating" (the web would re-lock the input through the live fallback).
   const activeRow = sections.flatMap(s => s.rows).find(r => r.active);
   const agentStatus: AgentStatus = activeRow?.dot === 'needs-attention'
     ? 'waiting_approval'
     : activeRow?.running
-      ? 'generating'
+      ? (sessionGenerating ? 'generating' : 'idle')
       : agentStatusFromComposerStatus(dump.composerStatus);
 
   return {

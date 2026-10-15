@@ -38,15 +38,16 @@ lifeline setup --server-url http://<your-lifeline-server>
 | Command | What it does |
 |---|---|
 | `lifeline setup --server-url <url>` | Browser login and start the agent |
+| `lifeline start` | Ensure the background agent |
+| `lifeline start --foreground` | Attached debug run |
 | `lifeline status` | Health: version, config, CDP, server reachability |
 | `lifeline update` | Upgrade to the latest (`--force` reinstalls) |
 | `lifeline stop` | Stop the daemon, keep the install |
-| `lifeline daemon install` / `uninstall` / `status` | Install / remove / inspect the daemon |
-| `lifeline start` | Run the agent in the foreground (debug) |
+| `lifeline uninstall` | Remove the background service (keeps ~/.lifeline and the CLI) |
 | `lifeline open` | Open the web console |
 | `lifeline config path` | Print the config file path |
 
-`lifeline status` compares against the latest; if you are behind it tells you to run `lifeline update`. Re-running `install.sh` also upgrades, but the daemon needs `lifeline daemon install` to pick up the new code.
+`lifeline status` compares against the latest; if you are behind it tells you to run `lifeline update`.
 
 ## Uninstall
 
@@ -54,7 +55,7 @@ lifeline setup --server-url http://<your-lifeline-server>
 curl -fsSL http://<your-lifeline-server>/public/uninstall.sh | sh
 ```
 
-`lifeline stop` stops without uninstalling; `lifeline daemon uninstall` removes the daemon.
+`lifeline stop` stops without uninstalling; `lifeline uninstall` removes the background service.
 
 ## Architecture
 

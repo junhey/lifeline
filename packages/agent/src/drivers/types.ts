@@ -71,6 +71,8 @@ export interface IdeBridgeOptions {
   titleSuffixes?: string[];
   relauncher?: CDPBridgeOptions['relauncher'];
   appNames?: string[];
+  /** Quiet-wake process probe (must be the same predicate as this slot's relauncher). */
+  quietWake?: CDPBridgeOptions['quietWake'];
 }
 
 /** live-ides probe injection signature (quiet strategy only, never a gate — review R1). */

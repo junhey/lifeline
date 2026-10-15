@@ -11,9 +11,9 @@
  *   pnpm exec tsx scripts/probes/probe-live-extract.ts --window demo-repo
  */
 import 'dotenv/config';
-import { CdpClient } from '../packages/agent/src/cdp/client.js';
-import { loadConfig, loadSelectors } from '../packages/agent/src/config.js';
-import { extractionFunction } from '../packages/agent/src/drivers/cursor/extractor.js';
+import { CdpClient } from '../../packages/agent/src/cdp/client.js';
+import { loadConfig, loadSelectors } from '../../packages/agent/src/config.js';
+import { extractionFunction } from '../../packages/agent/src/drivers/cursor/extractor.js';
 
 interface CDPTarget {
   id: string;

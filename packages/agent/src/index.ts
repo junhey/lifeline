@@ -4,8 +4,9 @@ import type { ContentSource } from './sources/content-source.js';
 import type { IdeKind } from './sources/types.js';
 import type { ChatElement, CursorState } from './types.js';
 import { hostname } from 'node:os';
+import { BUILD_VERSION } from '../../cli/src/build-version.js';
 import { includeProcessEnabled, loadCliConfig } from '../../cli/src/config.js';
-import { IDE_LABELS } from '../../protocol/src/index.js';
+import { IDE_LABELS, SYNC_REASON_PATCH_GAP } from '../../protocol/src/index.js';
 import { attachIdeCommandHandlers } from './command-router.js';
 import { loadConfig, loadSelectors } from './config.js';
 import { applyContentSource, ContentLiveRuntime } from './content-runtime.js';
@@ -19,10 +20,31 @@ import {
 import { registeredDrivers } from './drivers/index.js';
 import { createIdeSlot } from './ide-slot.js';
 import { canControlIde, detectLiveIdes } from './live-ides.js';
+import { PatchSequencer } from './patch-sequencer.js';
 import { SessionIndexReporter } from './session-index-reporter.js';
 import { resolveSessionId } from './session-lookup.js';
+import {
+  acquireAgentLock,
+  agentLockPath,
+  formatLockRefusal,
+  releaseAgentLock,
+} from './single-instance.js';
+import { readSuperseded } from './superseded-outcome.js';
 import { parseIde } from './types.js';
 import { Uplink } from './uplink.js';
+
+/**
+ * `process.exit` can drop buffered writes when stderr is a pipe, and a lost line from a failed
+ * start is exactly the silent failure this change exists to remove: give libuv the budget this
+ * file's fatal handler has always used. Declared before `main()` so that function's own doc block
+ * stays attached to it.
+ */
+async function exitAfterFlush(code: number): Promise<never> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, 100);
+  });
+  return process.exit(code);
+}
 
 /**
  * Local agent: thin client that dials out to the server and drives the IDE over
@@ -36,12 +58,42 @@ async function main(): Promise<void> {
   const config = loadConfig();
   if (!config.remoteUrl) {
     console.error('[agent] REMOTE_URL is required (address of the remote server)');
-    process.exit(1);
+    await exitAfterFlush(1);
   }
   if (!config.agentToken) {
     console.error('[agent] AGENT_TOKEN is required (must match the remote server)');
-    process.exit(1);
+    await exitAfterFlush(1);
   }
+  // The CLI path always supplies AGENT_ID (machine identity in `~/.lifeline/config.json`,
+  // see cli/config.ts); only running the bundle directly (`pnpm run agent`) falls
+  // back to hostname — that is a local debug path, not used for multi-user ownership.
+  // `||` not `??`: empty string must mean "absent", or we would register with an
+  // empty id (the server falls back to socket id, a new row on every reconnect).
+  const agentId = process.env.AGENT_ID || `agent-${hostname()}`;
+
+  // One agent per machine, decided **before** anything observable: no driver banner, no CDP probe,
+  // no uplink. A second process must fail as one legible line instead of registering and letting
+  // the server silently resolve the duplicate (工蜂 Issue #2). The block carries our own identity.
+  const lock = acquireAgentLock({ agentId, version: BUILD_VERSION, remoteUrl: config.remoteUrl });
+  if (!lock.ok) {
+    // The result already carries whether the holder is the service (`lifeline stop`) or something
+    // else, decided by the probe the lock made: this path must never re-probe, and must not name a
+    // way to kill a pid it could not identify.
+    for (const line of formatLockRefusal({
+      result: lock,
+      identity: { pid: process.pid, agentId, version: BUILD_VERSION, remoteUrl: config.remoteUrl },
+      lockPath: agentLockPath(),
+    })) {
+      console.error(line);
+    }
+    // Non-zero on purpose: launchd (`KeepAlive { SuccessfulExit: false }`) and systemd
+    // (`Restart=on-failure`) only relaunch a failed process, and a lock that has gone stale by
+    // then is taken over by the normal rule on the next attempt.
+    await exitAfterFlush(1);
+  }
+  console.log(`[agent] pid=${process.pid} agentId=${agentId} v${BUILD_VERSION} remote=${config.remoteUrl}`);
+  console.log(`[agent] lock ${agentLockPath()} (held by pid ${process.pid})`);
+
   const selectors = loadSelectors(config);
 
   const drivers = registeredDrivers();
@@ -53,12 +105,6 @@ async function main(): Promise<void> {
   console.log(`[agent] Poll interval: ${config.pollIntervalMs}ms`);
   console.log();
 
-  // The CLI path always supplies AGENT_ID (machine identity in `~/.lifeline/config.json`,
-  // see cli/config.ts); only running the bundle directly (`pnpm run agent`) falls
-  // back to hostname — that is a local debug path, not used for multi-user ownership.
-  // `||` not `??`: empty string must mean "absent", or we would register with an
-  // empty id (the server falls back to socket id, a new row on every reconnect).
-  const agentId = process.env.AGENT_ID || `agent-${hostname()}`;
   const liveIdes = detectLiveIdes();
   // Whether we can "control an IDE" is decided by the **platform** (Linux is
   // content-source only), not "whether a GUI app is installed".
@@ -79,6 +125,44 @@ async function main(): Promise<void> {
       clearTimeout(timer);
       resolve();
     });
+  });
+
+  /**
+   * The server gave this machine's slot to another process. Subscribed **here**, right after the
+   * handshake — not next to `rejected` further down: everything between this line and the driver
+   * setup takes seconds (the sync sqlite open/rebuild), the socket listener is already live during
+   * that window, and an event that arrives before a listener exists is dropped. Missing it is not
+   * self-healing: we would keep running (and holding the lock) while the server discards everything
+   * we report, and no watchdog rebuild corrects it because our socket never dropped.
+   *
+   * Whether we stand down is not a judgement call here: `readSuperseded` stands us down only for a
+   * superseder that names itself, because that is the one case where staying alive would only flap the
+   * slot. A superseder that cannot name itself took a slot the server already considered gone — we are
+   * the newer code, we hold the lock, and our next registration (the watchdog's reconnect) takes the
+   * slot back by the identity rule.
+   *
+   * Neither branch reconnects, re-registers or re-syncs on its own: standing down means exit, and
+   * keeping the lock means doing nothing at all about the slot.
+   */
+  uplink.on('superseded', (payload: unknown) => {
+    const { standDown, lines } = readSuperseded(payload);
+    // A stand-down is an exit reason, so it goes to stderr like the refusal; keeping the lock is a
+    // warning, and it has to be visible: "the console shows the other version" is the symptom the
+    // reader will be staring at.
+    const print = standDown ? console.error : console.warn;
+    for (const line of lines)
+      print(line);
+    if (!standDown)
+      return;
+    // Close our socket first: for the ~100 ms the flush takes, a socket that dropped could reconnect
+    // and re-register — carrying our non-empty instanceId, which would tell the winner that *it* was
+    // superseded too and turn one takeover into a round of churn.
+    uplink.disconnect();
+    // Release before exiting: hand the machine back cleanly. A leftover record keeps `lifeline status`
+    // showing a pid that is already gone, and a reused pid whose command line probes as "unknown" makes
+    // the next start refuse.
+    releaseAgentLock();
+    void exitAfterFlush(1);
   });
 
   const includeProcess = includeProcessEnabled(loadCliConfig());
@@ -138,6 +222,8 @@ async function main(): Promise<void> {
   // reported per IDE (P4 per-ide: server writes the matching slot; packets from
   // old agents without ide fall back to cursor on the server).
   const slots: Partial<Record<IdeKind, IdeSlot>> = {};
+  // Every state:patch is numbered so the server can notice a lost one and ask for a full state.
+  const patchSeq = new PatchSequencer();
   for (const { kind, driver } of drivers) {
     slots[kind] = createIdeSlot({
       kind,
@@ -146,7 +232,7 @@ async function main(): Promise<void> {
       config,
       runtime: runtimes[kind] ?? null,
       onPatch: (patch) => {
-        uplink.send('state:patch', { ide: kind, patch });
+        uplink.send('state:patch', patchSeq.stamp(kind, patch));
       },
       onConnection: (connected: boolean) => {
         uplink.send('connection:status', { ide: kind, connected });
@@ -185,7 +271,7 @@ async function main(): Promise<void> {
     for (const { kind } of drivers) {
       ides[kind] = slots[kind]!.stateManager.getCurrentState();
     }
-    uplink.send('state:full', { ides });
+    uplink.send('state:full', { ides, patchSeq: patchSeq.baseline() });
     for (const { kind } of drivers) {
       const active = runtimes[kind]?.getActiveSession();
       if (active)
@@ -193,11 +279,14 @@ async function main(): Promise<void> {
     }
   };
   uplink.on('connected', sendFullState);
-  uplink.on('sync', () => {
+  uplink.on('sync', (payload?: { reason?: string }) => {
     // The server may have a fresh ledger (this machine just connected, or was
     // just deleted on the web): re-report the full census too, or an unchanged
     // fingerprint skips every round and the server stays empty.
-    indexReporter.reset();
+    // Exception: a patch-gap sync only says the live state drifted; the census is
+    // untouched, and re-sending hundreds of session rows for it would be waste.
+    if (payload?.reason !== SYNC_REASON_PATCH_GAP)
+      indexReporter.reset();
     sendFullState();
   });
 
@@ -264,6 +353,8 @@ async function main(): Promise<void> {
     }
     await Promise.all(drivers.map(({ kind }) => slots[kind]!.stop()));
     uplink.disconnect();
+    // Only deletes our own record: if another agent already took the lock over, this is a no-op.
+    releaseAgentLock();
     process.exit(0);
   };
 
@@ -277,5 +368,5 @@ async function main(): Promise<void> {
 main().catch((err) => {
   const msg = `[agent] Fatal error: ${err instanceof Error ? err.message : String(err)}\n${err instanceof Error ? err.stack ?? '' : ''}`;
   console.error(msg);
-  setTimeout(() => process.exit(1), 100);
+  void exitAfterFlush(1);
 });

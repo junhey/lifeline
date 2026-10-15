@@ -1,11 +1,16 @@
+import type { DaemonProbe } from '../commands/daemon.js';
 import type { DaemonOpts, DaemonOutcome } from '../ui.js';
 import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { BUILD_VERSION } from '../build-version.js';
 import { applyCodeBuddyCdpArgv, applyCursorCdpArgv, revertCodeBuddyCdpArgvIfManaged, revertCursorCdpArgvIfManaged } from '../cdp-argv-state.js';
 import { loadCliConfig, LOG_DIR, saveCliConfig } from '../config.js';
 import { rebuildSqliteFor } from '../installer.js';
-import { log, requireConfig, tryRun } from '../ui.js';
+import { log, requireConfig, resolveCliEntry, tryRun } from '../ui.js';
+import { lifelinePidsExcept } from './agent-processes.js';
+import { decideEnsure } from './ensure-decision.js';
+import { readServiceVersion, writeServiceVersion } from './service-version.js';
 
 export const DAEMON_LABEL = 'com.lifeline.agent';
 
@@ -21,8 +26,14 @@ export function launchdPlist(nodeBin: string, cliEntry: string): string {
   <array>
     <string>${nodeBin}</string>
     <string>${cliEntry}</string>
-    <string>start</string>
+    <string>run</string>
   </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LIFELINE_SUPERVISED</key>
+    <string>1</string>
+  </dict>
 
   <key>RunAtLoad</key>
   <true/>
@@ -132,8 +143,128 @@ export function launchdJobLoaded(serviceRef: string): boolean {
   }
 }
 
-/** macOS daemon: launchd (RunAtLoad + KeepAlive). Darwin implementation of install / uninstall / status. */
-export function cmdDaemonLaunchd(action: string, opts: DaemonOpts = {}): DaemonOutcome | undefined {
+interface LaunchdJob {
+  state?: string;
+  pid?: number;
+}
+
+function launchctlFailureText(err: unknown): string {
+  if (!(err instanceof Error))
+    return String(err);
+  const extra = err as Error & { stderr?: unknown; stdout?: unknown };
+  return [extra.stderr, extra.stdout, extra.message].map(part => (part == null ? '' : String(part))).join('\n');
+}
+
+/** "Could not find service" is launchctl's not-loaded result. Other failures must not look like that. */
+function launchctlSaysNotLoaded(text: string): boolean {
+  return /Could not find service/i.test(text) || /\bnot loaded\b/i.test(text);
+}
+
+/**
+ * True when `pid` is the launchd job's pid.
+ * Not loaded → false. Any other `launchctl print` failure → true, so a sandboxed
+ * print runs the agent instead of bootout of this process. Non-darwin has no launchd job.
+ */
+export function currentProcessIsLaunchdJob(pid: number): boolean {
+  if (process.platform !== 'darwin')
+    return false;
+  try {
+    // Default execSync stderr is inherited, so a not-loaded job would print
+    // "Could not find service" on a normal `lifeline start`. Keep both streams.
+    const quiet = {
+      encoding: 'utf-8' as const,
+      stdio: ['ignore', 'pipe', 'pipe'] as ['ignore', 'pipe', 'pipe'],
+    };
+    const uid = execSync('id -u', quiet).trim();
+    const out = execSync(`launchctl print gui/${uid}/${DAEMON_LABEL}`, quiet);
+    const jobPid = /^\s*pid = (\d+)/m.exec(out)?.[1];
+    return jobPid != null && Number(jobPid) === pid;
+  }
+  catch (err) {
+    return !launchctlSaysNotLoaded(launchctlFailureText(err));
+  }
+}
+
+/** `launchctl print` body. Null when the job is not loaded. Job-loaded alone is not "running". */
+function readLaunchdJob(serviceRef: string): LaunchdJob | null {
+  try {
+    const out = execSync(`launchctl print ${serviceRef}`, { encoding: 'utf-8' });
+    const state = /state = (\S+)/.exec(out)?.[1];
+    const pidText = /^\s*pid = (\d+)/m.exec(out)?.[1];
+    const pid = pidText ? Number(pidText) : undefined;
+    return { state, pid };
+  }
+  catch {
+    return null;
+  }
+}
+
+/** Running means `state = running` and a pid. A loaded job that is waiting to restart is not running. */
+function launchdAgentUp(job: LaunchdJob | null): boolean {
+  return job?.state === 'running' && typeof job.pid === 'number' && job.pid > 0;
+}
+
+function currentCliEntry(): string | undefined {
+  const entry = resolveCliEntry();
+  return entry ? resolve(entry) : undefined;
+}
+
+export function probeLaunchdDaemon(): DaemonProbe {
+  const plistPath = launchdPlistPath();
+  const installed = existsSync(plistPath);
+  const cliEntry = currentCliEntry();
+  let registrationMatches = false;
+  if (installed && cliEntry) {
+    try {
+      registrationMatches = readFileSync(plistPath, 'utf-8') === launchdPlist(process.execPath, cliEntry);
+    }
+    catch {
+      registrationMatches = false;
+    }
+  }
+  const uid = execSync('id -u').toString().trim();
+  const job = readLaunchdJob(`gui/${uid}/${DAEMON_LABEL}`);
+  return {
+    installed,
+    running: launchdAgentUp(job),
+    registrationMatches,
+  };
+}
+
+function finishLaunchd(opts: DaemonOpts, outcome: DaemonOutcome, lines: string[]): DaemonOutcome {
+  if (opts.quiet)
+    return outcome;
+  for (const line of lines)
+    log(line);
+  for (const note of outcome.notes)
+    log(`  note   ${note}`);
+  return outcome;
+}
+
+function otherAgentOutcome(opts: DaemonOpts, pids: number[]): DaemonOutcome {
+  return finishLaunchd(opts, {
+    ok: false,
+    summary: `another lifeline agent is already running (pid ${pids.join(', ')})`,
+    notes: [],
+  }, [
+    `Could not start ${DAEMON_LABEL}.`,
+    `  another lifeline agent is already running (pid ${pids.join(', ')})`,
+  ]);
+}
+
+function recordLaunchdVersion(serviceRef: string): void {
+  if (launchdAgentUp(readLaunchdJob(serviceRef)))
+    writeServiceVersion(BUILD_VERSION);
+}
+
+/** kickstart's "job still loaded" is not a new process. The pid has to move. */
+function launchdReplaced(serviceRef: string, previousPid: number | undefined): boolean {
+  const job = readLaunchdJob(serviceRef);
+  return launchdAgentUp(job) && job?.pid !== previousPid;
+}
+
+/** macOS daemon: launchd (RunAtLoad + KeepAlive). Darwin implementation of install / uninstall. */
+export function cmdDaemonLaunchd(action: string, opts: DaemonOpts = {}, probe?: DaemonProbe): DaemonOutcome | undefined {
   const plistPath = launchdPlistPath();
   const uid = execSync('id -u').toString().trim();
   const serviceRef = `gui/${uid}/${DAEMON_LABEL}`;
@@ -144,50 +275,94 @@ export function cmdDaemonLaunchd(action: string, opts: DaemonOpts = {}): DaemonO
     // Resolve through symlink layers: argv[1] may be a session-scoped shim
     // (fnm multishells) that disappears once the shell exits. Bake the real
     // installation path into the plist so launchd can always find it.
-    let cliEntry: string | undefined;
-    try {
-      cliEntry = process.argv[1] ? realpathSync(process.argv[1]) : undefined;
-    }
-    catch {
-      cliEntry = undefined;
-    }
+    const cliEntry = currentCliEntry();
     if (!cliEntry || !existsSync(cliEntry)) {
       console.error(`Cannot resolve CLI entry (argv[1]=${process.argv[1]}). Run via the installed command.`);
       process.exit(1);
     }
 
+    const seen = probe ?? probeLaunchdDaemon();
+    const ensure = decideEnsure({
+      installed: seen.installed,
+      registrationMatches: seen.registrationMatches,
+      running: seen.running,
+      versionMatches: readServiceVersion() === BUILD_VERSION,
+    });
+    if (ensure === 'noop') {
+      return finishLaunchd(opts, {
+        ok: true,
+        summary: `already running (launchd ${DAEMON_LABEL})`,
+        notes: [],
+      }, [
+        `Already running: ${DAEMON_LABEL}`,
+        `  plist  ${plistPath}`,
+        `  logs   ${join(LOG_DIR, 'agent.out.log')}`,
+        'Check with: lifeline status',
+      ]);
+    }
+
+    const job = readLaunchdJob(serviceRef);
+    const foreign = lifelinePidsExcept(job?.pid ?? null);
+    if (foreign.length > 0)
+      return otherAgentOutcome(opts, foreign);
+
     mkdirSync(LOG_DIR, { recursive: true });
     // A fresh account may not have ~/Library/LaunchAgents yet.
     mkdirSync(dirname(plistPath), { recursive: true });
 
-    const plist = launchdPlist(nodeBin, resolve(cliEntry));
     const notes: string[] = [];
-    const sqliteError = rebuildSqliteFor(nodeBin);
-    if (sqliteError)
-      notes.push(`better-sqlite3 rebuild failed (${sqliteError}); chat history may be unavailable.`);
+    let ok = false;
+    let summary = 'not started';
+    let headline = `Could not start ${DAEMON_LABEL}.`;
 
-    /**
-     * Byte-identical registration + the job still loaded = this is just "swapped the runtime,
-     * restart it". `install.sh && lifeline daemon install` lands exactly here: swapping the
-     * runtime changes no path, so the plist is character-for-character the same.
-     *
-     * That case must kickstart, never bootout + bootstrap — there is an EIO window between the
-     * two, and hitting it kills the old process while the new one never registers, leaving the
-     * agent down for good (real-machine incident, 2026-09-21).
-     */
-    const restartOnly
-      = existsSync(plistPath) && readFileSync(plistPath, 'utf-8') === plist && launchdJobLoaded(serviceRef);
-
-    let ok: boolean;
-    if (restartOnly) {
-      const restarted = kickstartLaunchd(serviceRef);
-      ok = restarted.ok;
-      if (!restarted.ok) {
-        notes.push(`launchctl: ${restarted.error}`);
-        notes.push('retry by hand: lifeline daemon install');
+    if (ensure === 'start-only') {
+      // After `lifeline stop` the plist is still on disk but the job is not loaded.
+      // bootstrap of that file; bootout or a rewrite would drop the registration.
+      // An already-loaded job that is not `state = running` must kickstart:
+      // bootstrap fails when the job is already in the domain.
+      if (!launchdJobLoaded(serviceRef)) {
+        const boot = bootstrapLaunchd(uid, plistPath);
+        ok = boot.ok;
+        if (!boot.ok) {
+          notes.push(`launchctl: ${boot.error}`);
+          notes.push(`retry by hand: launchctl bootstrap gui/${uid} "${plistPath}"`);
+        }
       }
+      else {
+        const previousPid = readLaunchdJob(serviceRef)?.pid;
+        const restarted = kickstartLaunchd(serviceRef);
+        ok = launchdReplaced(serviceRef, previousPid);
+        if (!ok) {
+          notes.push(restarted.ok
+            ? 'the agent process did not change'
+            : `launchctl: ${restarted.error}`);
+          notes.push('retry by hand: lifeline start');
+        }
+      }
+      summary = ok ? `started (launchd ${DAEMON_LABEL})` : 'not started';
+      headline = ok ? `Started: ${DAEMON_LABEL}` : `Could not start ${DAEMON_LABEL}.`;
     }
-    else {
+    else if (ensure === 'restart-in-place') {
+      // Bytes already match. kickstart -k swaps the process and never enters the
+      // bootout → bootstrap EIO window (real-machine incident, 2026-09-21).
+      // Job-loaded is not success: the pid before kickstart must be gone.
+      const previousPid = readLaunchdJob(serviceRef)?.pid;
+      const restarted = kickstartLaunchd(serviceRef);
+      ok = launchdReplaced(serviceRef, previousPid);
+      if (!ok) {
+        notes.push(restarted.ok
+          ? 'the agent process did not change'
+          : `launchctl: ${restarted.error}`);
+        notes.push('retry by hand: lifeline start');
+      }
+      summary = ok ? `restarted (launchd ${DAEMON_LABEL})` : 'not started';
+      headline = ok ? `Restarted: ${DAEMON_LABEL}` : `Could not start ${DAEMON_LABEL}.`;
+    }
+    else if (ensure === 'reinstall') {
+      const sqliteError = rebuildSqliteFor(nodeBin);
+      if (sqliteError)
+        notes.push(`better-sqlite3 rebuild failed (${sqliteError}); chat history may be unavailable.`);
+      const plist = launchdPlist(nodeBin, cliEntry);
       execSync(`launchctl bootout ${serviceRef} 2>/dev/null || true`);
       writeFileSync(plistPath, plist, 'utf-8');
       const boot = bootstrapLaunchd(uid, plistPath);
@@ -196,30 +371,21 @@ export function cmdDaemonLaunchd(action: string, opts: DaemonOpts = {}): DaemonO
         notes.push(`launchctl: ${boot.error}`);
         notes.push(`retry by hand: launchctl bootstrap gui/${uid} "${plistPath}"`);
       }
+      const cfg = loadCliConfig();
+      if (cfg)
+        saveCliConfig(applyCodeBuddyCdpArgv(applyCursorCdpArgv(cfg).config).config);
+      summary = ok ? `started (launchd ${DAEMON_LABEL})` : 'not started';
+      headline = ok ? `Installed and started: ${DAEMON_LABEL}` : `Could not start ${DAEMON_LABEL}.`;
     }
 
-    const cfg = loadCliConfig();
-    if (cfg)
-      saveCliConfig(applyCodeBuddyCdpArgv(applyCursorCdpArgv(cfg).config).config);
-
-    const outcome: DaemonOutcome = {
-      ok,
-      summary: ok ? `${restartOnly ? 'restarted' : 'started'} (launchd ${DAEMON_LABEL})` : 'not started',
-      notes,
-    };
-    if (opts.quiet)
-      return outcome;
-
-    log(
-      ok
-        ? `${restartOnly ? 'Restarted' : 'Installed and started'}: ${DAEMON_LABEL}`
-        : `Could not start ${DAEMON_LABEL}.`,
-    );
-    log(`  plist  ${plistPath}`);
-    log(`  logs   ${join(LOG_DIR, 'agent.out.log')}`);
-    log('Check with: lifeline daemon status');
-    for (const note of notes) log(`  note   ${note}`);
-    return outcome;
+    if (ok)
+      recordLaunchdVersion(serviceRef);
+    return finishLaunchd(opts, { ok, summary, notes }, [
+      headline,
+      `  plist  ${plistPath}`,
+      `  logs   ${join(LOG_DIR, 'agent.out.log')}`,
+      'Check with: lifeline status',
+    ]);
   }
 
   if (action === 'uninstall') {
@@ -235,19 +401,6 @@ export function cmdDaemonLaunchd(action: string, opts: DaemonOpts = {}): DaemonO
     }
     revertCursorCdpArgvIfManaged();
     revertCodeBuddyCdpArgvIfManaged();
-    return;
-  }
-
-  if (action === 'status') {
-    try {
-      const out = execSync(`launchctl print ${serviceRef} 2>/dev/null`, { encoding: 'utf-8' });
-      const state = /state = (\S+)/.exec(out)?.[1];
-      const pid = /^\s*pid = (\d+)/m.exec(out)?.[1];
-      log(`daemon   ${state ?? 'unknown'}${pid ? ` (pid ${pid})` : ''}`);
-    }
-    catch {
-      log(`daemon   not installed (run: lifeline daemon install)`);
-    }
     return;
   }
 

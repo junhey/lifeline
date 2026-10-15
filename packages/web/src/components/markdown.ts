@@ -36,6 +36,20 @@ const fenceWithToolbar: RenderRule = (tokens, idx, options, env, self) => {
 
 md.renderer.rules.fence = fenceWithToolbar;
 
+/**
+ * Table gets a scroll box of its own (`.md-table-wrap` in tokens.css): a table wider than the column must scroll
+ * inside itself — left on its own it widens the transcript's scrollable width, which on the phone turns the session
+ * into a two-axis scroller (hold and drag pans it sideways).
+ */
+const tableWrapOpen: RenderRule = (tokens, idx, options, _env, self) =>
+  `<div class="md-table-wrap">${self.renderToken(tokens, idx, options)}`;
+
+const tableWrapClose: RenderRule = (tokens, idx, options, _env, self) =>
+  `${self.renderToken(tokens, idx, options)}</div>`;
+
+md.renderer.rules.table_open = tableWrapOpen;
+md.renderer.rules.table_close = tableWrapClose;
+
 export function renderMarkdown(text: string): string {
   return md.render(text ?? '');
 }

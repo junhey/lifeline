@@ -13,7 +13,7 @@ import {
   pruneWatermarks,
   pruneWatermarksByIde,
   saveWatermarks,
-
+  WATERMARK_VERSION,
 } from '../packages/agent/src/content-watermark.js';
 
 function wm(seq: number, updatedAt: number): SessionWatermark {
@@ -84,7 +84,15 @@ describe('content watermark', () => {
     saveWatermarks({ s1: wm(1, 1) }, path);
     assert.equal(loadWatermarks(path).s1.seq, 1);
     const raw = JSON.parse(readFileSync(path, 'utf-8')) as { version: number };
-    assert.equal(raw.version, 1);
+    assert.equal(raw.version, WATERMARK_VERSION);
+  });
+
+  it('ignores files written by an older version (their deltas were mis-numbered)', () => {
+    const path = join(dir, 'content-watermark.json');
+    writeFileSync(path, JSON.stringify({ version: 1, sessions: { s1: wm(5, 1) } }), 'utf-8');
+    assert.deepEqual(loadWatermarks(path), {});
+    writeFileSync(path, JSON.stringify({ sessions: { s1: wm(5, 1) } }), 'utf-8');
+    assert.deepEqual(loadWatermarks(path), {});
   });
 
   it('round-trips the tainted set through save→load and tolerates old files', () => {

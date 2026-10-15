@@ -197,7 +197,7 @@ describe('install scripts (PowerShell AST)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ps1-inline-'));
     try {
       const {
-        windowsAgentProbePsCommand,
+        windowsLifelinePidsPsCommand,
         windowsRegisterPsCommand,
         windowsStatusPsCommand,
         windowsStopPsCommand,
@@ -209,7 +209,7 @@ describe('install scripts (PowerShell AST)', () => {
         stop: windowsStopPsCommand(),
         unregister: windowsUnregisterPsCommand(),
         // install read-back check (`Get-CimInstance` / `Where-Object` both pass the ruler here)
-        probe: windowsAgentProbePsCommand(),
+        probe: windowsLifelinePidsPsCommand(),
       };
       const files = Object.entries(statements).map(([name, statement]) => {
         const file = join(dir, `${name}.ps1`);

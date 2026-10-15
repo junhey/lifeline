@@ -6,6 +6,7 @@ import { tryOpenCursorAdapter } from '../../content-runtime.js';
 import { cursorExeCandidates } from '../../win-paths.js';
 import { CommandExecutor } from './executor.js';
 import { DOMExtractor } from './extractor.js';
+import { defaultCursorCdpRelaunchDeps } from './relaunch.js';
 
 /**
  * Cursor: single-connection strategy — workbench CDP is everything (extract /
@@ -30,7 +31,17 @@ export const cursorDriver: IdeDriver = {
     return false;
   },
 
-  bridgeOptions: () => ({}),
+  bridgeOptions: () => ({
+    // 静默唤醒用与（默认）relauncher 同一判据的进程探针。注意：这里和 bridge
+    // 构造器里各建了一份 deps —— 不变量靠的是 `isCursorRunning` 在两份里解析到
+    // **同一个无状态函数**；若将来给 isRunning 加状态（缓存等），必须改为共享
+    // 实例（见 codebuddy/driver.ts 的做法），否则唤醒判据会偏离自愈判据。
+    // win32 的 tasklist 是同步派生（100ms+，timeout 5s），2s tick 会卡事件循环 —— 放宽。
+    quietWake: {
+      isRunning: defaultCursorCdpRelaunchDeps().isCursorRunning,
+      pollMs: process.platform === 'win32' ? 5_000 : undefined,
+    },
+  }),
   windowMonitor: { otherWindowsRequireWsUrl: true },
 
   openDiskAdapter: opts => tryOpenCursorAdapter(undefined, opts),

@@ -158,6 +158,15 @@ export interface ChatTab {
    * so the draft can be "sent as-is".
    */
   draftText?: string;
+  /**
+   * Multitask delegation: this row's sidebar spinner only mirrors **background sub-agents**
+   * while the session itself already finished (composer back to send state, terminal
+   * `data-composer-status`). The row keeps `status: 'generating'` (the IDE sidebar shows the
+   * same spinner), but the session is not "in progress" — the input must stay usable for the
+   * whole background run (measured 2026-09-30: delegation reply out at T, spinner cleared at
+   * T+6.5min with zero visible progress in between).
+   */
+  backgroundRunning?: boolean;
 }
 
 export type WindowKind = 'project' | 'agents';
@@ -289,6 +298,7 @@ export type NotCdpCause = 'http' | 'foreign';
 export type CdpRelaunchHint
   = | 'relaunched'
     | 'skipped-not-running'
+    | 'skipped-update-in-progress'
     | 'skipped-cooldown'
     | 'skipped-quit-pending'
     | 'skipped-warming-up'
@@ -433,6 +443,23 @@ export interface MachineInfo {
    * flows that don't yet know which machine. Default (old agent omits it) = the page falls back to the OS toggle.
    */
   platform?: AgentPlatform;
+  /**
+   * The **displaced** process, when this slot was taken over: the code whose reports are now being
+   * dropped. It answers "who is not reporting this machine" without ssh-ing anywhere.
+   * Cleared by that socket's own disconnect, by `forget()`, by the next takeover, or by a promotion
+   * that hands the row to **the socket this record names** (that process is reporting then). A
+   * promotion of a *different* candidate keeps it: the recorded process is still being dropped.
+   * Never persisted.
+   */
+  duplicateAgent?: DuplicateAgent;
+}
+
+export interface DuplicateAgent {
+  at: number;
+  /** Version the displaced process reported (`undefined` = an agent too old to report one). */
+  version?: string;
+  socketId: string;
+  instanceId?: string;
 }
 
 export interface MachinesListPayload {

@@ -35,7 +35,9 @@ index.ts（遍历 registeredDrivers() 组装）
 
 ## 踩坑（判据）
 
+- **`not-cdp`（Chrome 占了 9222）必须按 port 0 自愈**，与 `no-listener` 同族：不要停在「关掉它，或换一个端口」。只重启本 IDE，绝不要再去绑已被占用的配置端口（见 `bridge.ts`）。
 - **runtime 回调签名带 `ide` 参数位**：`ContentLiveRuntime` 的 onSessionFull/Append/Patch/Sync 是 `(sessionId, messages, ide, seq)`——runtime 自己传 `adapter.ide`，别用外层循环变量遮蔽（等价但少了参数位会 TS 报错）。
 - **`ContentSource.close()` 是可选方法**：调用要 `adapter.close?.()`。
 - **`CursorWindow['kind']` 可选**（`kind?`）：driver 接口的 windowKind 标注用 `WindowKind`，调用方自己 `?? 'project'` 兜底。
 - **extractor 回调的 errorMessage 是 `string | null | undefined`**：工厂上下文类型按此标注。
+- **Cursor 侧边栏「运行中」图标是 glass 点阵 loader**（CDP 实测 2026-10-10，Cursor 3.24.9）：运行中的会话行，前导图标是 `.agent-sidebar-cell-icon .ui-dot-grid-loader[data-shape="sine_3x3"]`（与 Agents 窗口的行同一个组件）；**旧 `.spinning-loader` / `.cursor-icon-modifier-spin` 在项目窗口里已不再出现**。`cursor/extractor.ts` 的 `cellIsRunning` 漏掉它就报 `active`，而 web 侧「行状态优先于窗口级 live」（`hasRowStatus`）→ 顶部写"空闲"、composer 不锁（用户反馈：会话明明在跑）。判定必须限定在 `.agent-sidebar-cell-icon` 槽位内：已完成行那里是 `.ui-agent-status-dot[data-variant=done-seen]`，不要把它当 running。

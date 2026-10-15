@@ -241,6 +241,15 @@ a {
   color: var(--text-secondary);
 }
 
+/* A table wider than the column scrolls inside this box instead of becoming the transcript's horizontal scroll
+   width (same phone symptom as `.tl-scroll`). `overflow-wrap: normal` keeps the table's intrinsic column widths —
+   the inherited `anywhere` from `.tl-item` would char-break every cell just to squeeze it into the column. */
+.md-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-wrap: normal;
+}
+
 .md-body table {
   border-collapse: collapse;
   margin: 8px 0;
@@ -270,6 +279,14 @@ a {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+
+  /* Vertical scroller only. `overflow-y: auto` next to the default `visible` x-axis computes x to `auto`, so a single
+     child wider than the column (pasted URL / file path in a bubble, mono tool row, wide markdown table — everything
+     `.tl-item`'s wrap rule below covers) silently turns this into a two-axis scroller: on the phone, hold then drag
+     pans the session sideways and vertical swipes wobble as soon as that region scrolls into view (2026-10-03
+     feedback). Containment lives here and not in `touch-action: pan-y`, which would also forbid the horizontal
+     panning that wide code / diff blocks need inside their own boxes. */
+  overflow-x: hidden;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
 }
@@ -283,6 +300,14 @@ a {
 
 .tl-list > .tl-item:first-child {
   margin-top: auto;
+}
+
+/* Every item's text wraps inside the column: one unbreakable run (URL / file path / hash / long identifier)
+   otherwise escapes its own box — bubbles are max-width, tool rows are flex with visible overflow — and lands in
+   .tl-scroll's scrollable width (see the note above). `pre` / `white-space: pre` (code, diffs) has no soft wrap
+   opportunities, so it is untouched and keeps scrolling inside its own box. */
+.tl-item {
+  overflow-wrap: anywhere;
 }
 
 /* ------------------------------------------------------------

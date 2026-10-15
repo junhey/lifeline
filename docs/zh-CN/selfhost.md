@@ -75,6 +75,8 @@ curl -fsSL http://<server>:8080/public/install.sh | sh
 lifeline setup --server-url http://<server>:8080
 ```
 
+一台机器一个 agent，且两台机器**绝不能**共用同一个 `agentId`（复制一份配置就足以让它们互相驱逐：机器锁看不见另一台主机）。诊断与拒绝文案见 [`agent-lifecycle.md`](./agent-lifecycle.md)。
+
 ## 已知边界（判据）
 
 - **本机（macOS/podman）无 compose 实现**：selfhost.sh 的 compose 路径在真实 docker 环境验证过文件生成/幂等/提示语义，`up -d` 全链路待在 Linux 机器补一次冒烟。

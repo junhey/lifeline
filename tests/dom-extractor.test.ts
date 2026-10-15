@@ -495,6 +495,33 @@ describe('extractionFunction', () => {
     assert.equal(state.activeComposerId, '437b6f36-8e5c-46e2-89b9-e6a93e7a47db');
   });
 
+  it('reads the Cursor 3.24.9 dot-grid loader as the row running state', () => {
+    // Measured 2026-10-10 (Cursor 3.24.9): a running row's leading icon is the glass dot-grid
+    // loader (no .spinning-loader / .cursor-icon-modifier-spin any more); a finished row carries
+    // the status dot instead. Missing the new loader made a generating row report `active`, and
+    // the web (row status wins over the window-level live state) showed "空闲" mid-run.
+    const state = withDom(`
+      <main id="root"></main>
+      <div class="composer-bar editor" data-composer-id="c-live"></div>
+      <div class="agent-sidebar-list">
+        <div class="agent-sidebar-cell" data-selected="true" data-composer-id="c-live">
+          <div class="agent-sidebar-cell-icon"><div class="agent-sidebar-cell-icon-default"><div style="display: contents;"><span class="ui-dot-grid-loader" data-color="current" data-size="xs" data-shape="sine_3x3" data-variant="default" aria-hidden="true"></span></div></div></div>
+          <div class="agent-sidebar-cell-text">CLI command redesign review</div>
+        </div>
+        <div class="agent-sidebar-cell" data-selected="false" data-composer-id="c-done">
+          <div class="agent-sidebar-cell-icon"><div class="agent-sidebar-cell-icon-default"><div style="display: contents;"><span aria-label="Completed"><span class="ui-agent-status-dot" data-variant="done-seen"></span></span></div></div></div>
+          <div class="agent-sidebar-cell-text">Lifeline agent sync</div>
+        </div>
+      </div>
+    `);
+
+    const running = state.chatTabs.find(t => t.composerId === 'c-live');
+    assert.equal(running?.status, 'generating');
+    // The status dot of a finished row must not read as running
+    const done = state.chatTabs.find(t => t.composerId === 'c-done');
+    assert.equal(done?.status, 'idle');
+  });
+
   it('scopes lastAssistantText to the transcript container', () => {
     const state = withDom(`
       <main id="root">
@@ -767,5 +794,50 @@ describe('extractionFunction', () => {
     );
     assert.equal(state.pendingApprovals.length, 1);
     assert.equal(state.pendingApprovals[0].description, 'npm test');
+  });
+});
+
+/*
+ * Multitask delegation (measured 2026-09-30): after the main reply hands work to
+ * background sub-agents, the sidebar row keeps its spinner while the session itself
+ * is finished — composer status is a terminal value and the send/stop control is
+ * back in send state. The row keeps `generating` (the IDE sidebar shows the same
+ * spinner) but must carry `backgroundRunning` so the web does not lock the input
+ * as "in progress" for the whole background run.
+ */
+describe('extractionFunction · multitask 后台委派', () => {
+  const backgroundDom = (composerStatus: string, stopButton: boolean): string => `
+    <main id="root">
+      <div class="composer-bar editor" data-composer-id="c-live" data-composer-status="${composerStatus}"></div>
+      ${stopButton ? '<div class="send-with-mode"><button data-stop-button="true"></button></div>' : ''}
+    </main>
+    <div class="agent-sidebar-list">
+      <div class="agent-sidebar-cell" data-composer-id="c-live" data-selected="true">
+        <div class="agent-sidebar-cell-icon"><div class="spinning-loader"></div></div>
+        <div class="agent-sidebar-cell-text">Delegated session</div>
+      </div>
+    </div>
+  `;
+
+  it('row spinner + 会话本体结束 → status generating + backgroundRunning', () => {
+    const state = withDom(backgroundDom('completed', false));
+    const active = state.chatTabs.find(t => t.isActive);
+    assert.equal(active?.status, 'generating');
+    assert.equal(active?.backgroundRunning, true);
+    assert.equal(state.activeComposerId, 'c-live');
+  });
+
+  it('stop 按钮在（会话本体在生成）→ 不打 backgroundRunning', () => {
+    const state = withDom(backgroundDom('completed', true));
+    const active = state.chatTabs.find(t => t.isActive);
+    assert.equal(active?.status, 'generating');
+    assert.equal(active?.backgroundRunning, undefined);
+  });
+
+  it('composer 状态为 generating → 不打 backgroundRunning', () => {
+    const state = withDom(backgroundDom('generating', false));
+    const active = state.chatTabs.find(t => t.isActive);
+    assert.equal(active?.status, 'generating');
+    assert.equal(active?.backgroundRunning, undefined);
   });
 });

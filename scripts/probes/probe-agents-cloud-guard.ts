@@ -15,9 +15,9 @@
  * Exit code: 0 = rule holds; 2 = rule broken.
  */
 import 'dotenv/config';
-import type { AgentsWindowDump } from '../packages/agent/src/drivers/cursor/agents-window.js';
-import { CdpClient } from '../packages/agent/src/cdp/client.js';
-import { loadConfig } from '../packages/agent/src/config.js';
+import type { AgentsWindowDump } from '../../packages/agent/src/drivers/cursor/agents-window.js';
+import { CdpClient } from '../../packages/agent/src/cdp/client.js';
+import { loadConfig } from '../../packages/agent/src/config.js';
 import {
   AGENTS_DUMP_TIMEOUT_MS,
 
@@ -25,9 +25,9 @@ import {
   isCloudAgentId,
   isCloudSectionId,
   mapAgentsWindowDump,
-} from '../packages/agent/src/drivers/cursor/agents-window.js';
-import { agentsRunOnLocalJS } from '../packages/agent/src/drivers/cursor/executor.js';
-import { listCloudAgentNames } from '../packages/agent/src/drivers/cursor/tab-identity.js';
+} from '../../packages/agent/src/drivers/cursor/agents-window.js';
+import { agentsRunOnLocalJS } from '../../packages/agent/src/drivers/cursor/executor.js';
+import { listCloudAgentNames } from '../../packages/agent/src/drivers/cursor/tab-identity.js';
 
 interface CDPTarget {
   id: string;

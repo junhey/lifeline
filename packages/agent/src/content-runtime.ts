@@ -418,7 +418,15 @@ export class ContentLiveRuntime {
     const started = Date.now();
     const index = hint?.index ?? this.adapter.readIndex(sessionId);
     const sizes = hint?.sizes ?? this.adapter.bubbleSizes?.(sessionId);
-    const wantFull = force === 'full' || force === 'patch-all' || !this.fullSent.has(sessionId);
+    // A session restored from the watermark has `fullSent` + `lastIndex` but **no `lastEmitted`** (the
+    // emitted element array is not persisted). The incremental branch below merges the patch into
+    // `lastEmitted`, so without it the "merged" array is only the new messages and `renumberFlatIndex`
+    // numbers them from 0 — colliding with the rows the server already holds, which the server then
+    // interleaves by flat_index (measured 2026-09-30: newest turns buried mid-session, tail stuck on
+    // old messages). No baseline ⇒ project the whole session once; full is authoritative on the server.
+    const hasBaseline = this.lastEmitted.has(sessionId);
+    const wantFull
+      = force === 'full' || force === 'patch-all' || !this.fullSent.has(sessionId) || !hasBaseline;
 
     // Ownership needs the freshest index available here: an id not in it counts as
     // complete (never overlay a message we cannot vouch for).

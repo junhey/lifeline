@@ -189,6 +189,179 @@ describe('CDPBridge.connect', () => {
     assert.equal(issues.length, 0);
   });
 
+  it('stays quiet while an IDE update is in progress (ShipIt swapping the .app)', async () => {
+    let relaunch = 0;
+    const issues: Array<CdpIssue | null> = [];
+    const bridge = new CDPBridge(dummyConfig(), {
+      relauncher: {
+        // IDE process still visible (quitting) + updater running → stand down
+        maybeRelaunch: async () => {
+          relaunch += 1;
+          return 'skipped-update-in-progress';
+        },
+      },
+      probe: async () => probeFail('no-listener', { detail: 'ECONNREFUSED' }),
+      createClient: () => new FakeCdpClient() as unknown as CdpClient,
+    });
+    bridge.on('issue', (issue: CdpIssue | null) => issues.push(issue));
+    bridge.on('error', () => {});
+
+    await bridge.connect();
+    await bridge.disconnect();
+
+    assert.equal(relaunch, 1);
+    // Update in progress = "waiting for the installer", not a fault: quiet, no issue.
+    assert.equal(issues.length, 0);
+  });
+
+  it('goes quiet (30s) when the burst fuse trips instead of 500ms-storming', async () => {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (msg?: unknown) => {
+      lines.push(String(msg));
+    };
+    let bridge!: CDPBridge;
+    try {
+      const issues: Array<CdpIssue | null> = [];
+      bridge = new CDPBridge(dummyConfig(), {
+        relauncher: { maybeRelaunch: async () => 'skipped-throttled' },
+        probe: async () => probeFail('no-listener', { detail: 'ECONNREFUSED' }),
+        createClient: () => new FakeCdpClient() as unknown as CdpClient,
+      });
+      bridge.on('issue', (issue: CdpIssue | null) => issues.push(issue));
+      bridge.on('error', () => {});
+
+      await bridge.connect();
+
+      assert.equal(issues.length, 1, '保险丝拦住是真实故障，仍然要上报');
+      assert.equal(issues[0]?.relaunch, 'skipped-throttled');
+      const reconnect = lines.filter(l => l.includes('Reconnecting in'));
+      assert.ok(reconnect.some(l => l.includes('30000ms')), reconnect.join(' | '));
+      assert.ok(!reconnect.some(l => l.includes('500ms')), '10 分钟窗口内不得 500ms 风暴刷日志');
+    }
+    finally {
+      console.log = original;
+      await bridge?.disconnect();
+    }
+  });
+
+  it('goes quiet (30s) while a quit is pending instead of 500ms-storming', async () => {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (msg?: unknown) => {
+      lines.push(String(msg));
+    };
+    let bridge!: CDPBridge;
+    try {
+      const issues: Array<CdpIssue | null> = [];
+      bridge = new CDPBridge(dummyConfig(), {
+        // 保存弹窗卡住：quit 反复失败 —— 不得 500ms 风暴（没有 10 分钟上界的那种）
+        relauncher: { maybeRelaunch: async () => 'skipped-quit-pending' },
+        probe: async () => probeFail('no-listener', { detail: 'ECONNREFUSED' }),
+        createClient: () => new FakeCdpClient() as unknown as CdpClient,
+      });
+      bridge.on('issue', (issue: CdpIssue | null) => issues.push(issue));
+      bridge.on('error', () => {});
+
+      await bridge.connect();
+
+      assert.equal(issues.length, 1, 'quit 卡住是真实状态，仍然要上报');
+      assert.equal(issues[0]?.relaunch, 'skipped-quit-pending');
+      const reconnect = lines.filter(l => l.includes('Reconnecting in'));
+      assert.ok(reconnect.some(l => l.includes('30000ms')), reconnect.join(' | '));
+      assert.ok(!reconnect.some(l => l.includes('500ms')), '保存弹窗卡住期间不得 500ms 风暴刷日志');
+    }
+    finally {
+      console.log = original;
+      await bridge?.disconnect();
+    }
+  });
+
+  it('quiet-wakes and probes as soon as the IDE process appears', async () => {
+    let relaunch = 0;
+    let probes = 0;
+    let running = false;
+    const bridge = new CDPBridge(dummyConfig(), {
+      relauncher: { maybeRelaunch: async () => { relaunch += 1; return 'skipped-not-running'; } },
+      probe: async () => {
+        probes += 1;
+        return probeFail('no-listener', { detail: 'ECONNREFUSED' });
+      },
+      createClient: () => new FakeCdpClient() as unknown as CdpClient,
+      quietWake: { isRunning: () => running, pollMs: 20 },
+    });
+    bridge.on('issue', () => {});
+    bridge.on('error', () => {});
+
+    try {
+      await bridge.connect();
+      assert.equal(probes, 1);
+      running = true; // 用户手动打开了 IDE
+      await new Promise(r => setTimeout(r, 80));
+      assert.equal(probes, 2, '上升沿立刻补一次探测，不等 30s 兜底');
+      assert.equal(relaunch, 2);
+    }
+    finally {
+      await bridge.disconnect();
+    }
+    running = false;
+    await new Promise(r => setTimeout(r, 60));
+    assert.equal(probes, 2, 'disconnect 之后 watcher 必须停');
+  });
+
+  it('does not re-probe while the IDE stays down (CDP cadence stays 30s)', async () => {
+    let probes = 0;
+    const bridge = new CDPBridge(dummyConfig(), {
+      relauncher: { maybeRelaunch: async () => 'skipped-not-running' },
+      probe: async () => {
+        probes += 1;
+        return probeFail('no-listener');
+      },
+      createClient: () => new FakeCdpClient() as unknown as CdpClient,
+      quietWake: { isRunning: () => false, pollMs: 20 },
+    });
+    bridge.on('issue', () => {});
+    bridge.on('error', () => {});
+    try {
+      await bridge.connect();
+      await new Promise(r => setTimeout(r, 100)); // 5 个 tick 全在"没在跑"
+      assert.equal(probes, 1);
+    }
+    finally {
+      await bridge.disconnect();
+    }
+  });
+
+  it('tracks the rising edge from a true baseline too (update relaunch, no-exe reopen)', async () => {
+    let probes = 0;
+    let running = true;
+    const bridge = new CDPBridge(dummyConfig(), {
+      relauncher: { maybeRelaunch: async () => 'skipped-no-exe' },
+      probe: async () => {
+        probes += 1;
+        return probeFail('no-listener');
+      },
+      createClient: () => new FakeCdpClient() as unknown as CdpClient,
+      quietWake: { isRunning: () => running, pollMs: 20 },
+    });
+    bridge.on('issue', () => {});
+    bridge.on('error', () => {});
+    try {
+      await bridge.connect(); // no-exe → 静默；基线 = 在跑
+      await new Promise(r => setTimeout(r, 60));
+      assert.equal(probes, 1, '没有沿 → 不触发');
+      running = false; // 更新换包：进程消失
+      await new Promise(r => setTimeout(r, 60));
+      assert.equal(probes, 1, '下降沿不触发');
+      running = true; // ShipIt 拉起新版本
+      await new Promise(r => setTimeout(r, 80));
+      assert.equal(probes, 2, 'true 基线也要能捕捉 消失→再现');
+    }
+    finally {
+      await bridge.disconnect();
+    }
+  });
+
   it('keeps using port 0 while the port file keeps moving after each relaunch', async () => {
     let mtime = 100;
     const ports: number[] = [];
@@ -290,6 +463,66 @@ describe('CDPBridge.connect', () => {
 
     assert.equal(issues[0]?.kind, 'no-listener');
     assert.equal(issues[0]?.relaunch, 'skipped-warming-up');
+  });
+
+  it('self-heals when 9222 is occupied (not-cdp http) by relaunching on port 0', async () => {
+    // Chrome (or any non-IDE) holding the configured fallback port used to only
+    // surface "关掉它，或换一个端口" and never self-heal. Relaunch this IDE on
+    // a random port; never re-bind the occupied configured port.
+    const ports: number[] = [];
+    const issues: Array<CdpIssue | null> = [];
+    const bridge = new CDPBridge(dummyConfig(), {
+      relauncher: {
+        maybeRelaunch: async (port) => {
+          ports.push(port);
+          return 'relaunched';
+        },
+      },
+      probe: async () => probeFail('not-cdp', {
+        notCdpCause: 'http',
+        occupant: 'Google Chrome (pid 3132)',
+        detail: 'CDP target discovery failed: HTTP 404',
+      }),
+      createClient: () => new FakeCdpClient() as unknown as CdpClient,
+    });
+    bridge.on('issue', (issue: CdpIssue | null) => issues.push(issue));
+    bridge.on('error', () => {});
+
+    await bridge.connect();
+    await bridge.disconnect();
+
+    assert.deepEqual(ports, [0]);
+    assert.equal(issues[0]?.kind, 'not-cdp');
+    assert.equal(issues[0]?.notCdpCause, 'http');
+    assert.equal(issues[0]?.relaunch, 'relaunched');
+  });
+
+  it('self-heals a foreign CDP on the configured port with port 0 (not the configured port)', async () => {
+    const ports: number[] = [];
+    const issues: Array<CdpIssue | null> = [];
+    const bridge = new CDPBridge(dummyConfig(), {
+      relauncher: {
+        maybeRelaunch: async (port) => {
+          ports.push(port);
+          return 'relaunched';
+        },
+      },
+      probe: async () => probeFail('not-cdp', {
+        notCdpCause: 'foreign',
+        browser: 'Chrome/148.0.7778.280',
+        detail: 'CDP browser is Chrome/148.0.7778.280, not Cursor',
+      }),
+      createClient: () => new FakeCdpClient() as unknown as CdpClient,
+    });
+    bridge.on('issue', (issue: CdpIssue | null) => issues.push(issue));
+    bridge.on('error', () => {});
+
+    await bridge.connect();
+    await bridge.disconnect();
+
+    assert.deepEqual(ports, [0], 'occupied/foreign configured port must not be re-requested');
+    assert.equal(issues[0]?.kind, 'not-cdp');
+    assert.equal(issues[0]?.relaunch, 'relaunched');
   });
 
   it('does not attach when probe returns no-window and emits that issue', async () => {

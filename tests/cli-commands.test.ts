@@ -89,6 +89,48 @@ describe('CLI command surface', () => {
     }
   });
 
+  it('dispatches hidden run without listing it in HELP', () => {
+    const documented = [...cli.matchAll(/^ {2}lifeline ([a-z-]+)/gm)].map(m => m[1]);
+    assert.equal(documented.includes('run'), false);
+    assert.match(cli, /case 'run':/);
+    const main = functionBody(cli, 'main');
+    assert.match(main, /case 'run':[\s\S]*?runAgent\(\)/);
+  });
+
+  /**
+   * `start` ensures the service. A service respawn of bare `start` still runs the agent.
+   * `--foreground` is decided first, so a debug run is not treated as that respawn.
+   * `daemon` stays a hidden alias; `uninstall` is listed (see the dedicated test).
+   */
+  it('start ensures the background agent unless this process is the service', () => {
+    const helpStart = cli.indexOf('const HELP = `');
+    const helpEnd = cli.indexOf('`;', helpStart);
+    const help = cli.slice(helpStart, helpEnd);
+    assert.match(help, /lifeline start[^\n]*[Ee]nsure the background agent/);
+    assert.match(help, /--foreground/);
+    assert.doesNotMatch(help, /lifeline daemon/);
+    assert.doesNotMatch(help, /lifeline run\b/);
+    assert.match(cli, /case 'run':/);
+    assert.match(cli, /case 'start':/);
+
+    const body = functionBody(cli, 'cmdStart');
+    const foregroundAt = body.indexOf('--foreground');
+    const detectAt = body.indexOf('detectServiceInvocation');
+    const ensureAt = body.indexOf('ensureDaemon()');
+    assert.ok(foregroundAt >= 0, 'start dispatch documents --foreground');
+    assert.ok(detectAt > foregroundAt, 'foreground is decided before service detection');
+    assert.ok(ensureAt > detectAt, 'detectServiceInvocation before ensure');
+    // ensureDaemon is cmdDaemon('install'); the install call must not move ahead of detection.
+    assert.match(functionBody(cli, 'ensureDaemon'), /cmdDaemon\('install'/);
+    const foreground = body.slice(foregroundAt, detectAt);
+    assert.doesNotMatch(foreground, /cmdDaemon/);
+    assert.match(foreground, /daemonProbe\(\)/);
+    assert.match(foreground, /lifeline stop/);
+    assert.match(foreground, /process\.exit\(1\)/);
+    assert.match(foreground, /runAgent\(\)/);
+    assert.match(body, /!outcome\.ok[\s\S]*process\.exit\(1\)/);
+  });
+
   /**
    * Stop ≠ uninstall: `stop` only stops the daemon; registration (plist / unit) stays. Removing CDP argv
    * and deleting the plist / unit is `daemon uninstall` — do not turn stop into a call-through to uninstall.
@@ -100,6 +142,80 @@ describe('CLI command surface', () => {
     assert.match(stop, /STOP_NOTE_KEPT/);
     assert.doesNotMatch(stop, /revertCursorCdpArgvIfManaged|revertCodeBuddyCdpArgvIfManaged/);
     assert.doesNotMatch(stop, /unlinkSync|rm -f|rm "/);
+    assert.match(stop, /lifeline start/);
+    assert.doesNotMatch(stop, /lifeline daemon install/);
+    const unix = functionBody(cli, 'stopDaemonUnix');
+    assert.match(unix, /lifeline start/);
+    assert.doesNotMatch(unix, /lifeline daemon install/);
+    assert.match(cli, /still installed: starts again at login, or run `lifeline start`/);
+    assert.doesNotMatch(cli, /`lifeline start` runs in the foreground/);
+    assert.match(cli, /const STOP_NOTE_FOREGROUND = '[^']*--foreground[^']*run/);
+  });
+
+  it('status prints a daemon row from daemonProbe after CDP and before remote', () => {
+    const body = functionBody(cli, 'cmdStatus');
+    const cursorAt = body.indexOf('logCdpStatus(\'cursor\'');
+    const codebuddyAt = body.indexOf('logCdpStatus(\'codebuddy\'');
+    const probeAt = body.indexOf('daemonProbe()');
+    const remoteAt = body.indexOf('/healthz');
+    assert.ok(cursorAt >= 0, 'status still probes cursor CDP');
+    assert.ok(codebuddyAt > cursorAt, 'codebuddy CDP after cursor');
+    assert.ok(probeAt > codebuddyAt, 'daemon row after cursor and codebuddy CDP');
+    assert.ok(remoteAt > probeAt, 'daemon row before remote health');
+    // The probe result is reused for the agent rows below, so the probe and the print are two
+    // statements now: what matters is that the row is still built from `daemonProbe()`.
+    assert.match(body, /const daemon = daemonProbe\(\)/);
+    assert.match(body, /logDaemonStatus\(daemon\)/);
+    // …and the agent rows belong between the daemon row and the remote check, so a reader who is
+    // debugging a duplicate agent gets them before anything that needs the network.
+    const agentAt = body.indexOf('agentStatusLines({');
+    assert.ok(agentAt > probeAt, 'agent rows after the daemon row');
+    assert.ok(agentAt < remoteAt, 'agent rows before the remote health check');
+    const helper = functionBody(cli, 'logDaemonStatus');
+    assert.match(helper, /daemon {3}\$\{label\}/);
+    assert.match(helper, /not installed/);
+    assert.match(helper, /running/);
+    assert.match(helper, /stopped/);
+    assert.match(helper, /probe\.note/);
+    assert.match(helper, / {2}note {3}\$\{probe\.note\}/);
+  });
+
+  it('uninstall removes the background service and does not delete config or the CLI', () => {
+    const helpStart = cli.indexOf('const HELP = `');
+    const helpEnd = cli.indexOf('`;', helpStart);
+    const help = cli.slice(helpStart, helpEnd);
+    assert.match(help, /lifeline uninstall[^\n]*[Bb]ackground service/);
+    assert.match(help, /lifeline uninstall[^\n]*~\/\.lifeline/);
+    assert.match(help, /lifeline uninstall[^\n]*CLI/);
+    assert.doesNotMatch(help, /lifeline daemon/);
+
+    const main = functionBody(cli, 'main');
+    assert.match(main, /case 'uninstall':[\s\S]*?cmdDaemon\('uninstall'\)/);
+    assert.match(
+      main,
+      /case 'uninstall':[\s\S]*?outcome && !outcome\.ok[\s\S]*?process\.exit\(1\)/,
+      'uninstall uses the same non-zero exit contract as daemon',
+    );
+    assert.match(main, /case 'daemon':/);
+  });
+
+  it('interactive setup starts the agent and prints the daemon row', () => {
+    const after = functionBody(cli, 'startAgentAfterSetup');
+    assert.match(after, /cmdDaemon\('install', \{ quiet: true \}\)/);
+
+    const setup = functionBody(cli, 'cmdSetup');
+    const saveAt = setup.lastIndexOf('saveCliConfig');
+    const startAt = setup.indexOf('startAgentAfterSetup()');
+    assert.ok(saveAt >= 0, 'interactive path still saves config');
+    assert.ok(startAt > saveAt, 'startAgentAfterSetup after saveCliConfig');
+    assert.match(setup, /row\('daemon', daemon\.summary\)/);
+    assert.match(setup, /!daemon\.ok[\s\S]*process\.exit\(1\)/);
+    assert.doesNotMatch(setup, /lifeline daemon install/);
+    const nextAt = setup.indexOf('row(\'next\'');
+    const failAt = setup.indexOf('!daemon.ok');
+    if (nextAt >= 0) {
+      assert.ok(failAt >= 0 && nextAt > failAt, 'do not print a success next line when the daemon row is not ok');
+    }
   });
 });
 
@@ -173,9 +289,8 @@ describe('platform-aware install/update', () => {
   it('reads back the process table by pid diff, not by "did anything match"', () => {
     const body = functionBody(cli, 'cmdDaemonWindows');
     assert.match(body, /windowsLifelinePidsPsCommand\(/, '先取"启动前那一份"');
-    assert.match(body, /windowsAgentProbePsCommand\(/, '启动后再探一次');
-    assert.match(body, /newLifelinePids\(/, '判据是集合差，不是"有没有命中"');
-    assert.match(body, /parseWindowsAgentPids\(/);
+    assert.match(body, /pollNewLifelinePids\(/, '启动后按间隔再探，直到出现新 pid 或超时');
+    assert.match(body, /listedLifelineAgentPids\(/, '命令行要经过 run/start 谓词，不能只收 pid');
     assert.match(body, /excludePid: process\.pid/, 'CLI 自己的 pid 必须排除（它的命令行也含 lifeline.mjs）');
   });
 
@@ -184,6 +299,7 @@ describe('platform-aware install/update', () => {
     const body = functionBody(cli, 'cmdDaemonWindows');
     assert.match(body, /but the agent is not running/);
     assert.match(body, /did not come up/);
+    assert.match(body, /not visible yet/);
   });
 
   // ExecutionTimeLimit defaults to 72 hours and would silently kill the agent after three days — must read back
@@ -199,6 +315,24 @@ describe('platform-aware install/update', () => {
     assert.match(body, /not restarted after a crash/);
     // Fallback path is a detached spawn — without windowsHide on Windows a console window pops
     assert.match(functionBody(cli, 'startDetachedAgent'), /windowsHide:\s*true/);
+  });
+
+  it('points the service templates at run and LIFELINE_SUPERVISED', () => {
+    const plist = functionBody(cli, 'launchdPlist');
+    assert.match(plist, /<string>run<\/string>/);
+    assert.doesNotMatch(plist, /<string>start<\/string>/);
+    assert.match(plist, /EnvironmentVariables/);
+    assert.match(plist, /LIFELINE_SUPERVISED/);
+
+    const unit = functionBody(cli, 'systemdUserUnit');
+    assert.match(unit, /\$\{systemdArg\(cliEntry\)\} run/);
+    assert.doesNotMatch(unit, /\$\{systemdArg\(cliEntry\)\} start/);
+    assert.match(unit, /LIFELINE_SUPERVISED=1/);
+
+    const detached = functionBody(cli, 'startDetachedAgent');
+    assert.match(detached, /\[cliEntry, 'run'\]/);
+    assert.doesNotMatch(detached, /\[cliEntry, 'start'\]/);
+    assert.match(detached, /env:\s*\{\s*\.\.\.process\.env,\s*LIFELINE_SUPERVISED:\s*'1'\s*\}/);
   });
 
   it('keeps the registration on stop, and only uninstall removes it', () => {
@@ -229,11 +363,20 @@ describe('platform-aware install/update', () => {
     assert.ok(install < start, '装完才能重启守护');
   });
 
-  it('only does the stop/start dance on win32', () => {
+  it('starts the just-installed bundle instead of ensuring in this process', () => {
     const body = functionBody(cli, 'cmdUpdate');
     assert.match(body, /process\.platform === 'win32'/);
-    // POSIX still goes "swap first then restartDaemon"
-    assert.match(body, /restartDaemon\(\)/);
+    const installed = body.split('log(`Installed:')[1] ?? '';
+    // This process's BUILD_VERSION is the one being replaced. An in-process
+    // ensure would see the new service-version stamp as a mismatch and write
+    // the old version back. The child is the new bundle.
+    assert.match(installed, /execFileSync\(nodeBin,\s*\[mjs,\s*'start'\]/);
+    assert.match(installed, /delete \w+\.LIFELINE_SUPERVISED/);
+    assert.match(installed, /delete \w+\.INVOCATION_ID/);
+    assert.doesNotMatch(installed, /cmdDaemon\(/);
+    assert.doesNotMatch(installed, /ensureDaemon\(/);
+    assert.doesNotMatch(installed, /restartDaemon\(/);
+    assert.doesNotMatch(installed, /startWindowsDaemon\(/);
   });
 
   // Use execFileSync rather than concatenating a shell string: one less quoting layer on Windows
@@ -258,18 +401,46 @@ describe('platform-aware install/update', () => {
   });
 
   /**
-   * Measured: `powershell -Command -` executes stdin statement by statement, so a throw inside the
-   * installer followed by a successful cleanup washes the exit code to 0. Success must mean "the new runtime can run".
+   * On Unix the upgrade script runs `start` under `set -e` after the new runtime is in place.
+   * A failed start makes the installer exit non-zero. That must not be treated as "the old
+   * runtime is still there": the new bundle has to be started again.
+   * A download failure may still exit inside runInstaller.
    */
-  it('treats a non-running installed runtime as a failed update', () => {
+  it('returns the installer status instead of exiting when the script is non-zero', () => {
+    const body = functionBody(cli, 'runInstaller');
+    assert.match(body, /Failed to download[\s\S]*?process\.exit\(1\)/);
+    assert.match(body, /return result\.status \?\? 1/);
+    assert.doesNotMatch(body, /existing runtime was left in place/);
+  });
+
+  /**
+   * Measured: `powershell -Command -` executes stdin statement by statement, so a throw inside the
+   * installer followed by a successful cleanup washes the exit code to 0. A bundle that does not
+   * run still fails. A non-zero status whose version string did not change fails the same way.
+   * A non-zero status whose version changed means the swap landed and start must be retried.
+   */
+  it('fails the update when the new bundle did not land', () => {
     const body = functionBody(cli, 'cmdUpdate');
-    assert.match(body, /if \(!now\)/, 'installedVersion() 返回 null 必须当失败');
-    // On the failure path: Windows stops the daemon first, so it must be started back up before reporting the error (order matters too)
+    const beforeAt = body.indexOf('const before = installedVersion');
+    const installAt = body.indexOf('await runInstaller');
+    assert.ok(beforeAt >= 0 && installAt >= 0 && beforeAt < installAt, 'read the current bundle before the installer');
+    const installerCall = body.slice(0, installAt);
+    assert.match(installerCall, /delete \w+\.LIFELINE_SUPERVISED/);
+    assert.match(installerCall, /delete \w+\.INVOCATION_ID/);
+    assert.match(body, /const status = await runInstaller/);
+    assert.match(body, /bundleFileReplaced\(/);
+    const replacedNull = body.indexOf('replaced && now == null');
+    const installedLog = body.indexOf('log(`Installed:');
+    assert.ok(replacedNull >= 0 && installedLog > replacedNull, 'a bundle that does not run must not log Installed');
+    assert.match(body, /The scheduled task was started again/);
+    assert.match(body, /did not run/);
     assert.match(
       body,
-      /if \(!now\)[\s\S]*?if \(onWindows\)\s*startWindowsDaemon\(\);[\s\S]*?Update failed:/,
-      '失败路径要先重启守护、再报错',
+      /!replaced && \(now == null \|\| \(status !== 0 && now === before\)\)[\s\S]*?!startWindowsDaemon\(\)[\s\S]*?did not start[\s\S]*?left in place/,
+      '没换上的路径要先把 Windows 任务拉起来；拉不起来必须说任务没起来',
     );
+    const installed = body.split('log(`Installed:')[1] ?? '';
+    assert.doesNotMatch(installed, /left in place/);
   });
 });
 
@@ -312,21 +483,21 @@ describe('launchd install/restart verdicts', () => {
 
   it('restarts an already-registered daemon instead of re-registering it', () => {
     const body = functionBody(cli, 'cmdDaemonLaunchd');
-    assert.match(
-      body,
-      /readFileSync\(plistPath, 'utf-8'\) === plist/,
-      'compare the registration first (an update leaves it byte-identical)',
-    );
-    assert.match(body, /launchdJobLoaded\(serviceRef\)/, 'and require the job to still be loaded');
-    assert.match(
+    assert.match(body, /decideEnsure\(/, 'bytes equal is not an unconditional kickstart; ensure consults decideEnsure');
+    assert.doesNotMatch(
       body,
       /if \(restartOnly\)\s*\{[\s\S]*?kickstartLaunchd\(serviceRef\)/,
-      'unchanged registration → restart in place (kickstart never touches it, so there is no EIO window)',
+      'bytes equal is no longer an unconditional kickstart',
     );
     assert.match(
       body,
-      /\}\s*else\s*\{[\s\S]*?launchctl bootout[\s\S]*?bootstrapLaunchd\(/,
-      'only re-register when the registration actually changed',
+      /['"]restart-in-place['"][\s\S]*?kickstartLaunchd\(serviceRef\)/,
+      'in-place restart is still kickstart (it never touches the registration, so there is no EIO window)',
+    );
+    assert.match(
+      body,
+      /['"]reinstall['"][\s\S]*?launchctl bootout[\s\S]*?writeFileSync\(plistPath[\s\S]*?bootstrapLaunchd\(/,
+      'reinstall still bootouts, writes the plist, and bootstraps',
     );
   });
 
@@ -345,6 +516,12 @@ describe('launchd install/restart verdicts', () => {
 
   // The last gate against a false success: the `install.sh && lifeline daemon install` upgrade chain
   // judges by exit code, so ok:false has to become a non-zero exit or scripts keep going.
+  it('install and status share daemonProbe', () => {
+    const body = functionBody(cli, 'cmdDaemon');
+    assert.match(body, /action === 'status'[\s\S]*?daemonProbe\(\)/);
+    assert.match(body, /action === 'install'[\s\S]*?daemonProbe\(\)/);
+  });
+
   it('exits non-zero when daemon install could not start the agent', () => {
     const body = functionBody(cli, 'main');
     assert.match(body, /cmdDaemon\(sub \?\? 'status'\)/);

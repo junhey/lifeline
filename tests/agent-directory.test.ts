@@ -201,6 +201,236 @@ describe('AgentDirectory', () => {
     assert.equal(d.getState('agent-a')?.ides.cursor?.agentActivityText, undefined);
   });
 
+  /**
+   * `register()` warns on a takeover (console is its only side channel — there is no event), so the
+   * tests below assert both the warning and the silence with one shared capture.
+   */
+  const captureWarn = (fn: () => void): string[] => {
+    const seen: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => {
+      seen.push(args.map(String).join(' '));
+    };
+    try {
+      fn();
+    }
+    finally {
+      console.warn = original;
+    }
+    return seen;
+  };
+
+  it('treats a reconnect (same instanceId) as the same process: state lands, the record survives', () => {
+    const current = fakeSocket('s1');
+    const reconnect = fakeSocket('s2');
+    d.register(current, { agentId: 'agent-a', hostname: 'A', version: '0.1.83', instanceId: 'inst-1' });
+    // A real displacement first, so there is a notice that the reconnect must not wipe.
+    captureWarn(() => d.register(fakeSocket('s0'), { agentId: 'agent-a', hostname: 'A', version: '0.1.84', instanceId: 'inst-9' }));
+    assert.equal(d.listMachines()[0].duplicateAgent?.socketId, 's1');
+
+    const warnings = captureWarn(() => d.register(reconnect, { agentId: 'agent-a', hostname: 'A', version: '0.1.84', instanceId: 'inst-9' }));
+
+    assert.deepEqual(warnings, []);
+    assert.equal(d.isActiveSocket(reconnect), true);
+    assert.equal(reconnect.events.some(e => e[0] === 'agent:sync'), true);
+    assert.equal(reconnect.events.some(e => e[0] === 'agent:superseded'), false);
+    // The new socket really feeds the machine state…
+    d.applyFull(reconnect, { ...emptyCursorState(), agentActivityText: 'fresh' });
+    assert.equal(d.getState('agent-a')?.ides.cursor?.agentActivityText, 'fresh');
+    // …and the notice about the earlier displacement is still there.
+    assert.equal(d.listMachines()[0].duplicateAgent?.socketId, 's1');
+  });
+
+  it('ignores an old-code newcomer while a process that names itself holds the slot', () => {
+    const current = fakeSocket('s1');
+    const old = fakeSocket('s2');
+    d.register(current, { agentId: 'agent-a', hostname: 'A', version: '0.1.83', instanceId: 'inst-1' });
+    const warnings = captureWarn(() => d.register(old, { agentId: 'agent-a', hostname: 'A', version: '0.0.0-dev' }));
+
+    assert.equal(d.isActiveSocket(current), true);
+    assert.equal(d.isActiveSocket(old), false);
+    assert.equal(old.events.some(e => e[0] === 'agent:sync'), false);
+    assert.equal(old.events.some(e => e[0] === 'agent:superseded'), false);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /ignored duplicate registration/);
+    assert.match(warnings[0]!, /at=\d{4}-\d{2}-\d{2}T[\d:.]+Z/);
+    // Its reports are dropped (it is not the active socket)…
+    d.applyPatch(old, { ide: 'cursor', patch: { agentActivityText: 'from-the-ignored-one' } });
+    assert.equal(d.getState('agent-a')?.ides.cursor?.agentActivityText, undefined);
+    // …and nothing was displaced, so there is nothing to notice.
+    assert.equal(d.listMachines()[0].duplicateAgent, undefined);
+  });
+
+  it('treats a blank instanceId as no identity, the way the agent side does', () => {
+    const current = fakeSocket('s1');
+    const blank = fakeSocket('s2');
+    d.register(current, { agentId: 'agent-a', hostname: 'A', version: '0.1.83', instanceId: 'inst-1' });
+    const warnings = captureWarn(() => d.register(blank, { agentId: 'agent-a', hostname: 'A', instanceId: '   ' }));
+
+    // A blank id is not an identity on either side of the wire (`superseded-outcome.ts` trims too):
+    // reading it as one here would hand the slot to a process the agent side refuses to stand down
+    // for — the two ends would disagree about the same registration and flap.
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /ignored duplicate registration/);
+    assert.equal(d.isActiveSocket(current), true);
+    assert.equal(d.isActiveSocket(blank), false);
+    assert.equal(d.listMachines()[0].duplicateAgent, undefined);
+  });
+
+  it('promotes the ignored socket when the active one goes away, and keeps the next candidate', () => {
+    const current = fakeSocket('s1');
+    const first = fakeSocket('s2');
+    const second = fakeSocket('s3');
+    d.register(current, { agentId: 'agent-a', hostname: 'A', version: '0.1.83', instanceId: 'inst-1' });
+    captureWarn(() => d.register(first, { agentId: 'agent-a', hostname: 'A' }));
+    captureWarn(() => d.register(second, { agentId: 'agent-a', hostname: 'A' }));
+    first.events.length = 0;
+
+    captureWarn(() => d.onSocketDisconnect(current));
+
+    // An old process never re-registers on its own: without promotion the machine would read offline
+    // while a live agent is attached.
+    assert.equal(d.isActiveSocket(first), true);
+    assert.equal(first.events.some(e => e[0] === 'agent:sync'), true);
+    assert.equal(d.listMachines()[0].connected, true);
+    // The row must not keep claiming the version of the process that just left.
+    assert.equal(d.listMachines()[0].cliVersion, undefined);
+    d.applyFull(first, { ...emptyCursorState(), agentActivityText: 'from-the-first' });
+    assert.equal(d.getState('agent-a')?.ides.cursor?.agentActivityText, 'from-the-first');
+
+    // …and the second candidate is still remembered, so a machine whose first replacement also leaves
+    // is not left dark.
+    captureWarn(() => d.onSocketDisconnect(first));
+    assert.equal(d.isActiveSocket(second), true);
+    assert.equal(d.listMachines()[0].connected, true);
+  });
+
+  it('promotion clears the recorded identity, so the next old registration is a takeover', () => {
+    const current = fakeSocket('s1');
+    const promoted = fakeSocket('s2');
+    d.register(current, { agentId: 'agent-a', hostname: 'A', version: '0.1.83', instanceId: 'inst-1' });
+    captureWarn(() => d.register(promoted, { agentId: 'agent-a', hostname: 'A', version: '0.0.0-dev' }));
+    captureWarn(() => d.onSocketDisconnect(current));
+    assert.equal(d.isActiveSocket(promoted), true);
+
+    // A different old process arrives. Had promotion left `instanceId = 'inst-1'` behind, this would be
+    // judged `ignore-duplicate` (a process that names itself still holds the slot) and be dropped.
+    const next = fakeSocket('s3');
+    captureWarn(() => d.register(next, { agentId: 'agent-a', hostname: 'A', version: '0.0.0-dev' }));
+    assert.equal(d.isActiveSocket(next), true);
+    assert.equal(d.isActiveSocket(promoted), false);
+    assert.equal(d.listMachines()[0].cliVersion, '0.0.0-dev');
+  });
+
+  it('warns on a takeover naming both identities, and records the displaced process', () => {
+    const old = fakeSocket('s1');
+    const current = fakeSocket('s2');
+    // An unrelated machine: the event is a message to one socket, not a broadcast.
+    const other = fakeSocket('s3');
+    d.register(other, { agentId: 'agent-b', hostname: 'B', version: '0.1.83' });
+    other.events.length = 0;
+    d.register(old, { agentId: 'agent-a', hostname: 'A', version: '0.1.82' });
+    const warnings = captureWarn(() => d.register(current, { agentId: 'agent-a', hostname: 'A', version: '0.1.83', instanceId: 'inst-2' }));
+
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /s1 → s2/);
+    assert.match(warnings[0]!, /version 0\.1\.82 → 0\.1\.83/);
+    assert.match(warnings[0]!, /instance none → inst-2/);
+    assert.match(warnings[0]!, /at=\d{4}-\d{2}-\d{2}T[\d:.]+Z/);
+    // Only the displaced socket is told, and the payload describes the winner…
+    const superseded = old.events.find(e => e[0] === 'agent:superseded')?.[1][0] as
+      | {
+        reason?: string;
+        by: { socketId: string; version?: string; hostname?: string; instanceId?: string };
+        at: number;
+      }
+      | undefined;
+    assert.equal(current.events.some(e => e[0] === 'agent:superseded'), false);
+    // The event is a message to one socket: no other machine hears about it.
+    assert.equal(other.events.some(e => e[0] === 'agent:superseded'), false);
+    assert.equal(superseded?.reason, 'duplicate-agent');
+    assert.equal(superseded?.by.socketId, 's2');
+    assert.equal(superseded?.by.version, '0.1.83');
+    assert.equal(superseded?.by.hostname, 'A');
+    assert.equal(superseded?.by.instanceId, 'inst-2');
+    // …and the record describes the loser, while the machine reports the winner.
+    const row = d.listMachines().find(m => m.agentId === 'agent-a');
+    assert.ok(row, 'the displaced machine is missing from the list');
+    assert.equal(row.cliVersion, '0.1.83');
+    assert.equal(row.duplicateAgent?.version, '0.1.82');
+    assert.equal(row.duplicateAgent?.socketId, 's1');
+  });
+
+  it('records the displaced release version when a dev build wins the slot', () => {
+    d.register(fakeSocket('s1'), { agentId: 'agent-a', hostname: 'A', version: '0.1.82' });
+    captureWarn(() => d.register(fakeSocket('s2'), { agentId: 'agent-a', hostname: 'A', version: '0.0.0-dev', instanceId: 'dev-1' }));
+
+    const row = d.listMachines()[0]!;
+    assert.equal(row.cliVersion, '0.0.0-dev');
+    assert.equal(row.duplicateAgent?.version, '0.1.82');
+  });
+
+  it('syncs on a first registration, so a fresh machine is not an empty shell', () => {
+    const fresh = fakeSocket('s1');
+    d.register(fresh, { agentId: 'agent-a', hostname: 'A', version: '0.1.83', instanceId: 'i1' });
+    // The contract is "the agent is asked to re-report", not "exactly once": a second sync on this
+    // path would be legitimate (and harmless) later.
+    assert.ok(fresh.events.some(e => e[0] === 'agent:sync'));
+  });
+
+  it('promotion clears the record: the promoted process is the one reporting now', () => {
+    const old = fakeSocket('s1');
+    const winner = fakeSocket('s2');
+    d.register(old, { agentId: 'agent-a', hostname: 'A', version: '0.1.80' });
+    captureWarn(() => d.register(winner, { agentId: 'agent-a', hostname: 'A', version: '0.1.83', instanceId: 'i2' }));
+    assert.equal(d.listMachines()[0].duplicateAgent?.socketId, 's1');
+
+    captureWarn(() => d.onSocketDisconnect(winner));
+
+    assert.equal(d.isActiveSocket(old), true);
+    // v0.1.80 reports this row now, so "已顶替 v0.1.80" would name the very code that is running.
+    assert.equal(d.listMachines()[0].duplicateAgent, undefined);
+  });
+
+  it('clears the record when the displaced socket disconnects, even though its mapping is gone', () => {
+    const first = fakeSocket('s1');
+    d.register(first, { agentId: 'agent-a', hostname: 'A', version: '0.1.82' });
+    captureWarn(() => d.register(fakeSocket('s2'), { agentId: 'agent-a', hostname: 'A', version: '0.1.83', instanceId: 'i2' }));
+    assert.equal(d.listMachines()[0].duplicateAgent?.socketId, 's1');
+    // register() removed the displaced socket's mapping: the clear must not depend on it.
+    assert.equal(d.isActiveSocket(first), false);
+
+    d.onSocketDisconnect(first);
+    assert.equal(d.listMachines()[0].duplicateAgent, undefined);
+  });
+
+  it('overwrites the record on the next takeover, and hands the slot on until the machine is dark', () => {
+    const first = fakeSocket('s1');
+    const second = fakeSocket('s2');
+    d.register(first, { agentId: 'agent-a', hostname: 'A', version: '0.1.82' });
+    captureWarn(() => d.register(second, { agentId: 'agent-a', hostname: 'A', version: '0.1.83', instanceId: 'i2' }));
+    const third = fakeSocket('s3');
+    captureWarn(() => d.register(third, { agentId: 'agent-a', hostname: 'A', version: '0.1.84', instanceId: 'i3' }));
+    assert.equal(d.listMachines()[0].duplicateAgent?.socketId, 's2');
+
+    // The displaced sockets are still connected, so the machine is handed over rather than going dark;
+    // the promotion takes the earliest remembered candidate (deterministic, see design.md).
+    d.onSocketDisconnect(third);
+    assert.equal(d.isActiveSocket(first), true);
+    // The record names `s2`, which is still connected and still being dropped: promoting `s1` must not
+    // hide that.
+    assert.equal(d.listMachines()[0].duplicateAgent?.socketId, 's2');
+    d.onSocketDisconnect(first);
+    assert.equal(d.isActiveSocket(second), true);
+    // Now the promoted socket *is* the recorded one, so the notice would name the reporter: cleared.
+    assert.equal(d.listMachines()[0].duplicateAgent, undefined);
+    // Only once nobody is left does "delete this machine" become possible — and then it really clears.
+    assert.equal(d.forget('agent-a'), false);
+    d.onSocketDisconnect(second);
+    assert.equal(d.forget('agent-a'), true);
+    assert.equal(d.listMachines().find(m => m.agentId === 'agent-a'), undefined);
+  });
+
   it('shows a machine only to its owner', () => {
     d.register(fakeSocket('sa'), { agentId: 'agent-a', hostname: 'A', owner: 'alice' });
     d.register(fakeSocket('sb'), { agentId: 'agent-b', hostname: 'B', owner: 'bob' });

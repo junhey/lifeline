@@ -284,6 +284,37 @@ describe('mapAgentsWindowDump', () => {
     const mapped = mapAgentsWindowDump(dump(), { windowId: 'w', resolveIds: false });
     assert.deepEqual((mapped.chatTabs ?? []).map(t => t.composerId), ['tab-0', 'tab-1', 'tab-2', 'tab-3']);
   });
+
+  /*
+   * Multitask delegation (measured 2026-09-30): after the main reply hands work to
+   * background sub-agents, the active row keeps its spinner while the session itself
+   * is done (terminal composer status, no stop button). The row keeps `generating`
+   * (the IDE sidebar shows the same spinner) but must carry `backgroundRunning` and
+   * must not report window-level "generating" — otherwise the web re-locks the input
+   * through the live-status fallback for the whole background run.
+   */
+  it('multitask 后台委派：行 spinner 亮但会话本体已结束 → backgroundRunning + 窗口级 idle', () => {
+    const d = dump();
+    d.sections[0].rows[0] = row({ title: 'Design plan discussion', active: true, running: true });
+    d.composerStatus = 'done';
+    d.stopGenerating = false;
+    const mapped = mapAgentsWindowDump(d, { windowId: 'w', deps: mapDeps() });
+    const active = (mapped.chatTabs ?? []).find(t => t.isActive);
+    assert.equal(active?.status, 'generating');
+    assert.equal(active?.backgroundRunning, true);
+    assert.equal(mapped.agentStatus, 'idle');
+  });
+
+  it('stop 按钮在（会话本体在生成）→ 不打 backgroundRunning，窗口级 generating', () => {
+    const d = dump();
+    d.sections[0].rows[0] = row({ title: 'Design plan discussion', active: true, running: true });
+    d.stopGenerating = true;
+    const mapped = mapAgentsWindowDump(d, { windowId: 'w', deps: mapDeps() });
+    const active = (mapped.chatTabs ?? []).find(t => t.isActive);
+    assert.equal(active?.status, 'generating');
+    assert.equal(active?.backgroundRunning, undefined);
+    assert.equal(mapped.agentStatus, 'generating');
+  });
 });
 
 /**
